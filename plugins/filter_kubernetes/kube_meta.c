@@ -631,15 +631,15 @@ static int merge_meta(struct flb_kube_meta *meta, struct flb_kube *ctx,
                 }
             }
         }
-
-        /* Pack Annotation properties */
-        void *prop_buf;
-        size_t prop_size;
-        flb_kube_prop_pack(&props, &prop_buf, &prop_size);
-        msgpack_sbuffer_write(&mp_sbuf, prop_buf, prop_size);
-        flb_kube_prop_destroy(&props);
-        flb_free(prop_buf);
     }
+
+	/* Pack Annotation properties */
+	void *prop_buf;
+	size_t prop_size;
+	flb_kube_prop_pack(&props, &prop_buf, &prop_size);
+	msgpack_sbuffer_write(&mp_sbuf, prop_buf, prop_size);
+	flb_kube_prop_destroy(&props);
+	flb_free(prop_buf);
 
     msgpack_unpacked_destroy(&api_result);
     msgpack_unpacked_destroy(&meta_result);

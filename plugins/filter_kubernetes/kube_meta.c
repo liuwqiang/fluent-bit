@@ -437,7 +437,8 @@ static int merge_meta(struct flb_kube_meta *meta, struct flb_kube *ctx,
     msgpack_object status_val;
     msgpack_object api_map;
     msgpack_object ann_map;
-    struct flb_kube_props props = {0};
+	//set the exclude default value to true
+    struct flb_kube_props props = {0,0,1};
 
     /*
      * - reg_buf: is a msgpack Map containing meta captured using Regex

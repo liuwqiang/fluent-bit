@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -17,14 +17,15 @@
  *  limitations under the License.
  */
 
-#include <fluent-bit/flb_info.h>
-#include <fluent-bit/flb_output.h>
+#include <fluent-bit/flb_output_plugin.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_str.h>
 #include <fluent-bit/flb_time.h>
 #include <fluent-bit/flb_gzip.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_network.h>
+#include <fluent-bit/flb_random.h>
+#include <fluent-bit/flb_config_map.h>
 #include <msgpack.h>
 
 #include <stdio.h>
@@ -77,6 +78,51 @@
  */
 
 /*
+ * Generate a unique message ID. The upper 48-bit is milliseconds
+ * since the Epoch, the lower 16-bit is a random nonce.
+ */
+static uint64_t message_id(void)
+{
+    uint64_t now;
+    uint16_t nonce;
+    struct flb_time tm;
+
+    if (flb_time_get(&tm) != -1) {
+        now = (uint64_t) tm.tm.tv_sec * 1000 + tm.tm.tv_nsec / 1000000;
+    }
+    else {
+        now = (uint64_t) time(NULL) * 1000;
+    }
+    nonce = (uint16_t) rand();
+
+    return (now << 16) | nonce;
+}
+
+/*
+ * A GELF header is 12 bytes in size. It has the following
+ * structure:
+ *
+ * +---+---+---+---+---+---+---+---+---+---+---+---+
+ * | MAGIC |           MESSAGE ID          |SEQ|NUM|
+ * +---+---+---+---+---+---+---+---+---+---+---+---+
+ *
+ * NUM is the total number of packets to send. SEQ is the
+ * unique sequence number for each packet (zero-indexed).
+ */
+#define GELF_MAGIC "\x1e\x0f"
+#define GELF_HEADER_SIZE 12
+
+static void init_chunk_header(uint8_t *buf, int count)
+{
+    uint64_t msgid = message_id();
+
+    memcpy(buf, GELF_MAGIC, 2);
+    memcpy(buf + 2, &msgid, 8);
+    buf[10] = 0;
+    buf[11] = count;
+}
+
+/*
  * Chunked GELF
  * Prepend the following structure to your GELF message to make it chunked:
  *   Chunked GELF magic bytes 2 bytes 0x1e 0x0f
@@ -90,66 +136,45 @@
  * already arrived and still arriving chunks.
  * A message MUST NOT consist of more than 128 chunks.
  */
-
 static int gelf_send_udp_chunked(struct flb_out_gelf_config *ctx, void *msg,
                                  size_t msg_size)
 {
     int ret;
-    uint8_t header[12];
     uint8_t n;
     size_t chunks;
     size_t offset;
-    struct flb_time tm;
-    uint64_t messageid;
-    struct msghdr msghdr;
-    struct iovec iov[2];
+    size_t len;
+    uint8_t *buf = (uint8_t *) ctx->pckt_buf;
 
     chunks = msg_size / ctx->pckt_size;
-    if ((msg_size % ctx->pckt_size) != 0)
+    if (msg_size % ctx->pckt_size != 0) {
         chunks++;
+    }
 
     if (chunks > 128) {
-        flb_error("[out_gelf] message too big: %zd bytes, too many chunks",
-                  msg_size);
+        flb_plg_error(ctx->ins, "message too big: %zd bytes", msg_size);
         return -1;
     }
 
-    flb_time_get(&tm);
-
-    messageid = ((uint64_t)(tm.tm.tv_nsec*1000000 + tm.tm.tv_nsec) << 32) |
-                (uint64_t)rand_r(&(ctx->seed));
-
-    header[0] = 0x1e;
-    header[1] = 0x0f;
-    memcpy (header+2, &messageid, 8);
-    header[10] = chunks;
-
-    iov[0].iov_base = header;
-    iov[0].iov_len = 12;
-
-    memset(&msghdr, 0, sizeof(struct msghdr));
-    msghdr.msg_iov = iov;
-    msghdr.msg_iovlen = 2;
+    init_chunk_header(buf, chunks);
 
     offset = 0;
     for (n = 0; n < chunks; n++) {
-        header[11] = n;
+        buf[10] = n;
 
-        iov[1].iov_base = msg + offset;
-        if ((msg_size - offset) < ctx->pckt_size) {
-            iov[1].iov_len = msg_size - offset;
+        len = msg_size - offset;
+        if (ctx->pckt_size < len) {
+            len = ctx->pckt_size;
         }
-        else {
-            iov[1].iov_len = ctx->pckt_size;
-        }
+        memcpy(buf + GELF_HEADER_SIZE, (char *) msg + offset, len);
 
-        ret = sendmsg(ctx->fd, &msghdr, MSG_DONTWAIT | MSG_NOSIGNAL);
+        ret = send(ctx->fd, buf, len + GELF_HEADER_SIZE,
+                   MSG_DONTWAIT | MSG_NOSIGNAL);
         if (ret == -1) {
             flb_errno();
         }
         offset += ctx->pckt_size;
     }
-
     return 0;
 }
 
@@ -202,13 +227,13 @@ static int gelf_send_udp(struct flb_out_gelf_config *ctx, char *msg,
     return 0;
 }
 
-void cb_gelf_flush(const void *data, size_t bytes,
-                   const char *tag, int tag_len,
-                   struct flb_input_instance *i_ins,
-                   void *out_context,
-                   struct flb_config *config)
+static void cb_gelf_flush(struct flb_event_chunk *event_chunk,
+                          struct flb_output_flush *out_flush,
+                          struct flb_input_instance *i_ins,
+                          void *out_context,
+                          struct flb_config *config)
 {
-    struct flb_out_gelf_config *ctx = out_context;
+    int ret;
     flb_sds_t s;
     flb_sds_t tmp;
     msgpack_unpacked result;
@@ -220,20 +245,22 @@ void cb_gelf_flush(const void *data, size_t bytes,
     msgpack_object map;
     msgpack_object *obj;
     struct flb_time tm;
-    struct flb_upstream_conn *u_conn;
-    int ret;
+    struct flb_upstream_conn *u_conn = NULL;
+    struct flb_out_gelf_config *ctx = out_context;
 
     if (ctx->mode != FLB_GELF_UDP) {
         u_conn = flb_upstream_conn_get(ctx->u);
         if (!u_conn) {
-            flb_error("[out_gelf] no upstream connections available");
+            flb_plg_error(ctx->ins, "no upstream connections available");
             FLB_OUTPUT_RETURN(FLB_RETRY);
         }
     }
 
     msgpack_unpacked_init(&result);
 
-    while (msgpack_unpack_next(&result, data, bytes, &off) == MSGPACK_UNPACK_SUCCESS) {
+    while (msgpack_unpack_next(&result,
+                               event_chunk->data, event_chunk->size,
+                               &off) == MSGPACK_UNPACK_SUCCESS) {
         size = off - prev_off;
         prev_off = off;
         if (result.data.type != MSGPACK_OBJECT_ARRAY) {
@@ -280,7 +307,7 @@ void cb_gelf_flush(const void *data, size_t bytes,
             }
         }
         else {
-            flb_error("[out_gelf] error encoding to GELF");
+            flb_plg_error(ctx->ins, "error encoding to GELF");
         }
 
         flb_sds_destroy(s);
@@ -295,27 +322,28 @@ void cb_gelf_flush(const void *data, size_t bytes,
     FLB_OUTPUT_RETURN(FLB_OK);
 }
 
-int cb_gelf_init(struct flb_output_instance *ins, struct flb_config *config,
-                 void *data)
+static int cb_gelf_init(struct flb_output_instance *ins, struct flb_config *config,
+                        void *data)
 {
     int ret;
-    int fd;
     const char *tmp;
     struct flb_out_gelf_config *ctx = NULL;
 
-
     /* Set default network configuration */
-    if (!ins->host.name) {
-        ins->host.name = flb_strdup("127.0.0.1");
-    }
-    if (ins->host.port == 0) {
-        ins->host.port = 12201;
-    }
+    flb_output_net_default("127.0.0.1", 12201, ins);
 
     /* Allocate plugin context */
     ctx = flb_calloc(1, sizeof(struct flb_out_gelf_config));
     if (!ctx) {
         flb_errno();
+        return -1;
+    }
+    ctx->ins = ins;
+
+    ret = flb_output_config_map_set(ins, (void *) ctx);
+    if (ret == -1) {
+        flb_plg_error(ins, "flb_output_config_map_set failed");
+        flb_free(ctx);
         return -1;
     }
 
@@ -332,7 +360,7 @@ int cb_gelf_init(struct flb_output_instance *ins, struct flb_config *config,
             ctx->mode = FLB_GELF_UDP;
         }
         else {
-            flb_error("[out_gelf] Unknown gelf mode %s", tmp);
+            flb_plg_error(ctx->ins, "Unknown gelf mode %s", tmp);
             flb_free(ctx);
             return -1;
         }
@@ -371,49 +399,30 @@ int cb_gelf_init(struct flb_output_instance *ins, struct flb_config *config,
         ctx->fields.level_key = flb_sds_create(tmp);
     }
 
-    /* Config UDP Packet_Size */
-    tmp = flb_output_get_property("packet_size", ins);
-    if (tmp != NULL && atoi(tmp) >= 0) {
-        ctx->pckt_size = atoi(tmp);
-    }
-    else {
-        ctx->pckt_size = 1420;
-    }
-
-    /* Config UDP Compress */
-    tmp = flb_output_get_property("compress", ins);
-    if (tmp) {
-        ctx->compress = flb_utils_bool(tmp);
-    }
-    else {
-        ctx->compress = FLB_TRUE;
-    }
-
     /* init random seed */
-    fd = open("/dev/urandom", O_RDONLY);
-    if (fd == -1) {
+    if (flb_random_bytes((unsigned char *) &ctx->seed, sizeof(int))) {
         ctx->seed = time(NULL);
     }
-    else {
-        unsigned int val;
-        ret = read(fd, &val, sizeof(val));
-        if (ret > 0) {
-            ctx->seed = val;
-        }
-        else {
-            ctx->seed = time(NULL);
-        }
-        close(fd);
-    }
+    srand(ctx->seed);
 
     ctx->fd = -1;
+    ctx->pckt_buf = NULL;
+
     if (ctx->mode == FLB_GELF_UDP) {
-        ctx->fd = flb_net_udp_connect(ins->host.name, ins->host.port);
+        ctx->fd = flb_net_udp_connect(ins->host.name, ins->host.port,
+                                      ins->net_setup.source_address);
         if (ctx->fd < 0) {
             flb_free(ctx);
             return -1;
         }
-    } else {
+        ctx->pckt_buf = flb_malloc(GELF_HEADER_SIZE + ctx->pckt_size);
+        if (ctx->pckt_buf == NULL) {
+            flb_socket_close(ctx->fd);
+            flb_free(ctx);
+            return -1;
+        }
+    }
+    else {
         int io_flags = FLB_IO_TCP;
 
         if (ctx->mode == FLB_GELF_TLS) {
@@ -425,11 +434,12 @@ int cb_gelf_init(struct flb_output_instance *ins, struct flb_config *config,
         }
 
         ctx->u = flb_upstream_create(config, ins->host.name, ins->host.port,
-                                             io_flags, (void *) &ins->tls);
+                                             io_flags, ins->tls);
         if (!(ctx->u)) {
             flb_free(ctx);
             return -1;
         }
+        flb_output_upstream_set(ctx->u, ins);
     }
 
     /* Set the plugin context */
@@ -437,9 +447,13 @@ int cb_gelf_init(struct flb_output_instance *ins, struct flb_config *config,
     return 0;
 }
 
-int cb_gelf_exit(void *data, struct flb_config *config)
+static int cb_gelf_exit(void *data, struct flb_config *config)
 {
     struct flb_out_gelf_config *ctx = data;
+
+    if (ctx == NULL) {
+        return 0;
+    }
 
     if (ctx->u) {
         flb_upstream_destroy(ctx->u);
@@ -454,10 +468,63 @@ int cb_gelf_exit(void *data, struct flb_config *config)
     flb_sds_destroy(ctx->fields.full_message_key);
     flb_sds_destroy(ctx->fields.level_key);
 
+    flb_free(ctx->pckt_buf);
     flb_free(ctx);
 
     return 0;
 }
+
+
+static struct flb_config_map config_map[] = {
+    {
+     FLB_CONFIG_MAP_STR, "mode", "udp",
+     0, FLB_FALSE, 0,
+     "The protocol to use. 'tls', 'tcp' or 'udp'"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "gelf_short_message_key", NULL,
+     0, FLB_FALSE, 0,
+     "A short descriptive message (MUST be set in GELF)"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "gelf_timestamp_key", NULL,
+     0, FLB_FALSE, 0,
+     "Timestamp key name (SHOULD be set in GELF)"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "gelf_host_key", NULL,
+     0, FLB_FALSE, 0,
+     "Key which its value is used as the name of the host,"
+     "source or application that sent this message. (MUST be set in GELF) "
+    },
+    {
+     FLB_CONFIG_MAP_STR, "gelf_full_message_key", NULL,
+     0, FLB_FALSE, 0,
+     "Key to use as the long message that can i.e. contain a backtrace. "
+     "(Optional in GELF)"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "gelf_level_key", NULL,
+     0, FLB_FALSE, 0,
+     "Key to be used as the log level. "
+     "Its value must be in standard syslog levels (between 0 and 7). "
+     "(Optional in GELF)"
+    },
+    {
+     FLB_CONFIG_MAP_INT, "packet_size", "1420",
+     0, FLB_TRUE, offsetof(struct flb_out_gelf_config, pckt_size),
+     "If transport protocol is udp, you can set the size of packets to be sent."
+    },
+    {
+     FLB_CONFIG_MAP_BOOL, "compress", "true",
+     0, FLB_TRUE, offsetof(struct flb_out_gelf_config, compress),
+     "If transport protocol is udp, "
+     "you can set this if you want your UDP packets to be compressed."
+    },
+
+    /* EOF */
+    {0}
+};
 
 /* Plugin reference */
 struct flb_output_plugin out_gelf_plugin = {
@@ -468,4 +535,5 @@ struct flb_output_plugin out_gelf_plugin = {
     .cb_flush       = cb_gelf_flush,
     .cb_exit        = cb_gelf_exit,
     .flags          = FLB_OUTPUT_NET | FLB_IO_OPT_TLS,
+    .config_map     = config_map
 };

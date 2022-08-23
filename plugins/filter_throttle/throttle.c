@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -18,13 +17,11 @@
  *  limitations under the License.
  */
 
-#include <stdio.h>
-#include <sys/types.h>
-
 #include <fluent-bit/flb_info.h>
+#include <fluent-bit/flb_filter.h>
+#include <fluent-bit/flb_filter_plugin.h>
 #include <fluent-bit/flb_mem.h>
 #include <fluent-bit/flb_str.h>
-#include <fluent-bit/flb_filter.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_log.h>
@@ -34,6 +31,11 @@
 
 #include "throttle.h"
 #include "window.h"
+
+#include <stdio.h>
+#include <sys/types.h>
+
+pthread_mutex_t throttle_mut;
 
 
 static bool apply_suffix (double *x, char suffix_char)
@@ -67,24 +69,30 @@ static bool apply_suffix (double *x, char suffix_char)
 
 void *time_ticker(void *args)
 {
-    struct ticker *t = args;
     struct flb_time ftm;
     long timestamp;
+    struct flb_filter_throttle_ctx *ctx = args;
 
-    while (!t->done) {
+    while (1) {
         flb_time_get(&ftm);
         timestamp = flb_time_to_double(&ftm);
-        window_add(t->ctx->hash, timestamp, 0);
+        pthread_mutex_lock(&throttle_mut);
+        window_add(ctx->hash, timestamp, 0);
 
-        t->ctx->hash->current_timestamp = timestamp;
+        ctx->hash->current_timestamp = timestamp;
 
-        if (t->ctx->print_status) {
-            flb_info("[filter_throttle] %i: limit is %0.2f per %s with window size of %i, current rate is: %i per interval", timestamp, t->ctx->max_rate, t->ctx->slide_interval, t->ctx->window_size, t->ctx->hash->total / t->ctx->hash->size);
+        if (ctx->print_status) {
+            flb_plg_info(ctx->ins,
+                         "%ld: limit is %0.2f per %s with window size of %i, "
+                         "current rate is: %i per interval",
+                         timestamp, ctx->max_rate, ctx->slide_interval,
+                         ctx->window_size,
+                         ctx->hash->total / ctx->hash->size);
         }
-        sleep(t->seconds);
+        pthread_mutex_unlock(&throttle_mut);
+        /* sleep is a cancelable function */
+        sleep(ctx->ticker_data.seconds);
     }
-
-    return NULL;
 }
 
 /* Given a msgpack record, do some filter action based on the defined rules */
@@ -101,46 +109,25 @@ static inline int throttle_data(struct flb_filter_throttle_ctx *ctx)
 
 static int configure(struct flb_filter_throttle_ctx *ctx, struct flb_filter_instance *f_ins)
 {
-    const char *str = NULL;
-    double val  = 0;
-    char *endp;
+    int ret;
 
-    /* rate per second */
-    str = flb_filter_get_property("rate", f_ins);
-
-    if (str != NULL && (val = strtod(str, &endp)) > 1) {
-        ctx->max_rate = val;
-    } else {
-        ctx->max_rate = THROTTLE_DEFAULT_RATE;
+    ret = flb_filter_config_map_set(f_ins, ctx);
+    if (ret == -1)  {
+        flb_plg_error(f_ins, "unable to load configuration");
+        return -1;
+    }
+    if (ctx->max_rate <= 1.0) {
+        ctx->max_rate = strtod(THROTTLE_DEFAULT_RATE, NULL);
+    }
+    if (ctx->window_size <= 1) {
+        ctx->window_size = strtoul(THROTTLE_DEFAULT_WINDOW, NULL, 10);
     }
 
-    /* windows size */
-    str = flb_filter_get_property("window", f_ins);
-    if (str != NULL && (val = strtoul(str, &endp, 10)) > 1) {
-        ctx->window_size = val;
-    } else {
-        ctx->window_size = THROTTLE_DEFAULT_WINDOW;
-    }
-
-    /* print informational status */
-    str = flb_filter_get_property("print_status", f_ins);
-    if (str != NULL) {
-        ctx->print_status = flb_utils_bool(str);
-    } else {
-        ctx->print_status = THROTTLE_DEFAULT_STATUS;
-    }
-
-    /* sliding interval */
-    str = flb_filter_get_property("interval", f_ins);
-    if (str != NULL) {
-        ctx->slide_interval = str;
-    } else {
-        ctx->slide_interval = THROTTLE_DEFAULT_INTERVAL;
-    }
     return 0;
 }
 
-static int parse_duration(const char *interval)
+static int parse_duration(struct flb_filter_throttle_ctx *ctx,
+                          const char *interval)
 {
     double seconds = 0.0;
     double s;
@@ -153,7 +140,10 @@ static int parse_duration(const char *interval)
           /* Check any suffix char and update S based on the suffix.  */
           || ! apply_suffix (&s, *p))
         {
-            flb_warn("[filter_throttle] invalid time interval %s falling back to default: 1 second", interval);
+            flb_plg_warn(ctx->ins,
+                         "invalid time interval %s falling back to default: 1 "
+                         "second",
+                         interval);
         }
 
       seconds += s;
@@ -166,8 +156,8 @@ static int cb_throttle_init(struct flb_filter_instance *f_ins,
 {
     int ret;
     struct flb_filter_throttle_ctx *ctx;
-    pthread_t tid;
-    struct ticker *ticker_ctx;
+
+    pthread_mutex_init(&throttle_mut, NULL);
 
     /* Create context */
     ctx = flb_malloc(sizeof(struct flb_filter_throttle_ctx));
@@ -175,6 +165,7 @@ static int cb_throttle_init(struct flb_filter_instance *f_ins,
         flb_errno();
         return -1;
     }
+    ctx->ins = f_ins;
 
     /* parse plugin configuration  */
     ret = configure(ctx, f_ins);
@@ -183,16 +174,13 @@ static int cb_throttle_init(struct flb_filter_instance *f_ins,
         return -1;
     }
 
-    ctx->hash = window_create(ctx->window_size);
-
     /* Set our context */
     flb_filter_set_context(f_ins, ctx);
 
-    ticker_ctx = flb_malloc(sizeof(struct ticker));
-    ticker_ctx->ctx = ctx;
-    ticker_ctx->done = false;
-    ticker_ctx->seconds = parse_duration(ctx->slide_interval);
-    pthread_create(&tid, NULL, &time_ticker, ticker_ctx);
+    ctx->hash = window_create(ctx->window_size);
+
+    ctx->ticker_data.seconds = parse_duration(ctx, ctx->slide_interval);
+    pthread_create(&ctx->ticker_data.thr, NULL, &time_ticker, ctx);
     return 0;
 }
 
@@ -200,6 +188,7 @@ static int cb_throttle_filter(const void *data, size_t bytes,
                               const char *tag, int tag_len,
                               void **out_buf, size_t *out_size,
                               struct flb_filter_instance *f_ins,
+                              struct flb_input_instance *i_ins,
                               void *context,
                               struct flb_config *config)
 {
@@ -210,11 +199,12 @@ static int cb_throttle_filter(const void *data, size_t bytes,
     msgpack_object root;
     size_t off = 0;
     (void) f_ins;
+    (void) i_ins;
     (void) config;
     msgpack_sbuffer tmp_sbuf;
     msgpack_packer tmp_pck;
 
-    /* Create temporal msgpack buffer */
+    /* Create temporary msgpack buffer */
     msgpack_sbuffer_init(&tmp_sbuf);
     msgpack_packer_init(&tmp_pck, &tmp_sbuf, msgpack_sbuffer_write);
 
@@ -228,8 +218,9 @@ static int cb_throttle_filter(const void *data, size_t bytes,
         }
 
         old_size++;
-
+        pthread_mutex_lock(&throttle_mut);
         ret = throttle_data(context);
+        pthread_mutex_unlock(&throttle_mut);
         if (ret == THROTTLE_RET_KEEP) {
             msgpack_pack_object(&tmp_pck, root);
             new_size++;
@@ -250,13 +241,29 @@ static int cb_throttle_filter(const void *data, size_t bytes,
     /* link new buffers */
     *out_buf   = tmp_sbuf.data;
     *out_size = tmp_sbuf.size;
-
     return FLB_FILTER_MODIFIED;
 }
 
 static int cb_throttle_exit(void *data, struct flb_config *config)
 {
+    void *thr_res;
     struct flb_filter_throttle_ctx *ctx = data;
+
+    int s = pthread_cancel(ctx->ticker_data.thr);
+    if (s != 0) {
+        flb_plg_error(ctx->ins, "Unable to cancel ticker. Leaking context to avoid memory corruption.");
+        return 1;
+    }
+
+    s = pthread_join(ctx->ticker_data.thr, &thr_res);
+    if (s != 0) {
+        flb_plg_error(ctx->ins, "Unable to join ticker. Leaking context to avoid memory corruption.");
+        return 1;
+    }
+
+    if (thr_res != PTHREAD_CANCELED) {
+        flb_plg_error(ctx->ins, "Thread joined but was not canceled which is impossible.");
+    }
 
     flb_free(ctx->hash->table);
     flb_free(ctx->hash);
@@ -264,11 +271,41 @@ static int cb_throttle_exit(void *data, struct flb_config *config)
     return 0;
 }
 
+static struct flb_config_map config_map[] = {
+    // rate
+    // window
+    // print_status
+    // interval
+    {
+     FLB_CONFIG_MAP_DOUBLE, "rate", THROTTLE_DEFAULT_RATE,
+     0, FLB_TRUE, offsetof(struct flb_filter_throttle_ctx, max_rate),
+     "Set throttle rate"
+    },
+    {
+     FLB_CONFIG_MAP_INT, "window", THROTTLE_DEFAULT_WINDOW,
+     0, FLB_TRUE, offsetof(struct flb_filter_throttle_ctx, window_size),
+     "Set throttle window"
+    },
+    {
+     FLB_CONFIG_MAP_BOOL, "print_status", THROTTLE_DEFAULT_STATUS,
+     0, FLB_TRUE, offsetof(struct flb_filter_throttle_ctx, print_status),
+     "Set whether or not to print status information"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "interval", THROTTLE_DEFAULT_INTERVAL,
+     0, FLB_TRUE, offsetof(struct flb_filter_throttle_ctx, slide_interval),
+     "Set the slide interval"
+    },
+    /* EOF */
+    {0}
+};
+
 struct flb_filter_plugin filter_throttle_plugin = {
     .name         = "throttle",
     .description  = "Throttle messages using sliding window algorithm",
     .cb_init      = cb_throttle_init,
     .cb_filter    = cb_throttle_filter,
     .cb_exit      = cb_throttle_exit,
+    .config_map   = config_map,
     .flags        = 0
 };

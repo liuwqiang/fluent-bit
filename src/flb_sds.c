@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,12 +22,15 @@
  * SDS library created by Antirez at https://github.com/antirez/sds.
  */
 
+#include <fluent-bit/flb_compat.h>
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_mem.h>
 #include <fluent-bit/flb_log.h>
 #include <fluent-bit/flb_sds.h>
 #include <fluent-bit/flb_utf8.h>
+
 #include <stdarg.h>
+#include <ctype.h>
 
 static flb_sds_t sds_alloc(size_t size)
 {
@@ -107,11 +109,7 @@ flb_sds_t flb_sds_increase(flb_sds_t s, size_t len)
         flb_errno();
         return NULL;
     }
-
-    if (tmp != head) {
-        head = tmp;
-    }
-
+    head = (struct flb_sds *) tmp;
     head->alloc += len;
     out = head->buf;
 
@@ -140,6 +138,123 @@ flb_sds_t flb_sds_cat(flb_sds_t s, const char *str, int len)
 
     return s;
 }
+
+
+/*
+ * remove empty spaces on left/right from sds buffer 's' and return the new length
+ * of the content.
+ */
+int flb_sds_trim(flb_sds_t s)
+{
+    unsigned int i;
+    unsigned int len;
+    char *left = 0, *right = 0;
+    char *buf;
+
+    if (!s) {
+        return -1;
+    }
+
+    len = flb_sds_len(s);
+    if (len == 0) {
+        return 0;
+    }
+
+    buf = s;
+    left = buf;
+
+    /* left spaces */
+    while (left) {
+        if (isspace(*left)) {
+            left++;
+        }
+        else {
+            break;
+        }
+    }
+
+    right = buf + (len - 1);
+    /* Validate right v/s left */
+    if (right < left) {
+        buf[0] = '\0';
+        return -1;
+    }
+
+    /* Move back */
+    while (right != buf){
+        if (isspace(*right)) {
+            right--;
+        }
+        else {
+            break;
+        }
+    }
+
+    len = (right - left) + 1;
+    for (i=0; i<len; i++) {
+        buf[i] = (char) left[i];
+    }
+    buf[i] = '\0';
+    flb_sds_len_set(buf, i);
+
+    return i;
+}
+
+int flb_sds_cat_safe(flb_sds_t *buf, const char *str, int len)
+{
+    flb_sds_t tmp;
+
+    tmp = flb_sds_cat(*buf, str, len);
+    if (!tmp) {
+        return -1;
+    }
+    *buf = tmp;
+    return 0;
+}
+
+flb_sds_t flb_sds_cat_esc(flb_sds_t s, const char *str, int len,
+                                       char *esc, size_t esc_size)
+{
+    size_t avail;
+    struct flb_sds *head;
+    flb_sds_t tmp = NULL;
+    uint32_t c;
+    int i;
+
+    avail = flb_sds_avail(s);
+    if (avail < len) {
+        tmp = flb_sds_increase(s, len);
+        if (!tmp) {
+            return NULL;
+        }
+        s = tmp;
+    }
+    head = FLB_SDS_HEADER(s);
+
+    for (i = 0; i < len; i++) {
+        if (flb_sds_avail(s) < 8) {
+            tmp = flb_sds_increase(s, 8);
+            if (tmp == NULL) {
+                return NULL;
+            }
+            s = tmp;
+            head = FLB_SDS_HEADER(s);
+        }
+        c = (unsigned char) str[i];
+        if (esc != NULL && c < esc_size && esc[c] != 0) {
+            s[head->len++] = '\\';
+            s[head->len++] = esc[c];
+        }
+        else {
+            s[head->len++] = c;
+        }
+    }
+
+    s[head->len] = '\0';
+
+    return s;
+}
+
 
 flb_sds_t flb_sds_copy(flb_sds_t s, const char *str, int len)
 {
@@ -247,6 +362,9 @@ flb_sds_t flb_sds_cat_utf8 (flb_sds_t *sds, const char *str, int str_len)
             cp = 0;
             for (b = 0; b < hex_bytes; b++) {
                 p = (const unsigned char *) str + i + b;
+                if (p >= (unsigned char *) (str + str_len)) {
+                    break;
+                }
                 ret = flb_utf8_decode(&state, &cp, *p);
                 if (ret == 0) {
                     break;
@@ -262,11 +380,11 @@ flb_sds_t flb_sds_cat_utf8 (flb_sds_t *sds, const char *str, int str_len)
             s[head->len++] = '\\';
             s[head->len++] = 'u';
             if (cp > 0xFFFF) {
-                c = int2hex[ (unsigned char) ((cp & 0xf00000) >> 20)];
+                c = (unsigned char) ((cp & 0xf00000) >> 20);
                 if (c > 0) {
                     s[head->len++] = int2hex[c];
                 }
-                c = int2hex[ (unsigned char) ((cp & 0x0f0000) >> 16)];
+                c = (unsigned char) ((cp & 0x0f0000) >> 16);
                 if (c > 0) {
                     s[head->len++] = int2hex[c];
                 }
@@ -308,33 +426,34 @@ flb_sds_t flb_sds_printf(flb_sds_t *sds, const char *fmt, ...)
     }
 
     va_start(ap, fmt);
-
     size = vsnprintf((char *) (s + flb_sds_len(s)), flb_sds_avail(s), fmt, ap);
     if (size < 0) {
         flb_warn("[%s] buggy vsnprintf return %d", __FUNCTION__, size);
         va_end(ap);
         return NULL;
     }
+    va_end(ap);
+
     if (size > flb_sds_avail(s)) {
         tmp = flb_sds_increase(s, size);
         if (!tmp) {
-            va_end(ap);
             return NULL;
         }
         *sds = s = tmp;
+
+        va_start(ap, fmt);
         size = vsnprintf((char *) (s + flb_sds_len(s)), flb_sds_avail(s), fmt, ap);
         if (size > flb_sds_avail(s)) {
             flb_warn("[%s] vsnprintf is insatiable ", __FUNCTION__);
             va_end(ap);
             return NULL;
         }
+        va_end(ap);
     }
 
     head = FLB_SDS_HEADER(s);
     head->len += size;
     s[head->len] = '\0';
-
-    va_end(ap);
 
     return s;
 }
@@ -349,4 +468,33 @@ void flb_sds_destroy(flb_sds_t s)
 
     head = FLB_SDS_HEADER(s);
     flb_free(head);
+}
+
+/*
+ * flb_sds_snprintf is a wrapper of snprintf.
+ * The difference is that this function can increase the buffer of flb_sds_t.
+ */
+int flb_sds_snprintf(flb_sds_t *str, size_t size, const char *fmt, ...)
+{
+    va_list va;
+    flb_sds_t tmp;
+    int ret;
+
+ retry_snprintf:
+    va_start(va, fmt);
+    ret = vsnprintf(*str, size, fmt, va);
+    if (ret > size) {
+        tmp = flb_sds_increase(*str, ret-size);
+        if (tmp == NULL) {
+            return -1;
+        }
+        *str = tmp;
+        size = ret;
+        va_end(va);
+        goto retry_snprintf;
+    }
+    va_end(va);
+
+    flb_sds_len_set(*str, ret);
+    return ret;
 }

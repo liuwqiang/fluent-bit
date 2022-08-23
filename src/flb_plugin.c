@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,6 +22,8 @@
 #include <fluent-bit/flb_mem.h>
 #include <fluent-bit/flb_log.h>
 #include <fluent-bit/flb_error.h>
+#include <fluent-bit/flb_kv.h>
+#include <fluent-bit/flb_config_format.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_plugin.h>
 #include <fluent-bit/flb_plugin_proxy.h>
@@ -34,7 +35,7 @@
 #define PLUGIN_EXTENSION        ".so"
 #define PLUGIN_STRUCT_SUFFIX    "_plugin"
 #define PLUGIN_STR_MIN                                              \
-    ((sizeof(PLUGIN_PREFIX) - 1) + sizeof(PLUGIN_EXTENSION - 1))
+    ((sizeof(PLUGIN_PREFIX) - 1) + sizeof(PLUGIN_EXTENSION) - 1)
 
 static int is_input(char *name)
 {
@@ -184,7 +185,7 @@ struct flb_plugins *flb_plugin_create()
 int flb_plugin_load(char *path, struct flb_plugins *ctx,
                     struct flb_config *config)
 {
-    int type;
+    int type = -1;
     void *dso_handle;
     void *symbol = NULL;
     char *plugin_stname;
@@ -205,6 +206,7 @@ int flb_plugin_load(char *path, struct flb_plugins *ctx,
      */
     plugin_stname = path_to_plugin_name(path);
     if (!plugin_stname) {
+        dlclose(dso_handle);
         return -1;
     }
 
@@ -215,26 +217,54 @@ int flb_plugin_load(char *path, struct flb_plugins *ctx,
                   "registration structure is missing '%s'",
                   path, plugin_stname);
         flb_free(plugin_stname);
+        dlclose(dso_handle);
         return -1;
     }
 
     /* Detect plugin type and link it to the main context */
     if (is_input(plugin_stname) == FLB_TRUE) {
         type = FLB_PLUGIN_INPUT;
-        input = (struct flb_input_plugin *) symbol;
+        input = flb_malloc(sizeof(struct flb_input_plugin));
+        if (!input) {
+            flb_errno();
+            flb_free(plugin_stname);
+            dlclose(dso_handle);
+            return -1;
+        }
+        memcpy(input, symbol, sizeof(struct flb_input_plugin));
         mk_list_add(&input->_head, &config->in_plugins);
     }
     else if (is_filter(plugin_stname) == FLB_TRUE) {
         type = FLB_PLUGIN_FILTER;
-        filter = (struct flb_filter_plugin *) symbol;
+        filter = flb_malloc(sizeof(struct flb_filter_plugin));
+        if (!filter) {
+            flb_errno();
+            flb_free(plugin_stname);
+            dlclose(dso_handle);
+            return -1;
+        }
+        memcpy(filter, symbol, sizeof(struct flb_filter_plugin));
         mk_list_add(&filter->_head, &config->filter_plugins);
     }
     else if (is_output(plugin_stname) == FLB_TRUE) {
         type = FLB_PLUGIN_OUTPUT;
-        output = (struct flb_output_plugin *) symbol;
+        output = flb_malloc(sizeof(struct flb_output_plugin));
+        if (!output) {
+            flb_errno();
+            flb_free(plugin_stname);
+            dlclose(dso_handle);
+            return -1;
+        }
+        memcpy(output, symbol, sizeof(struct flb_output_plugin));
         mk_list_add(&output->_head, &config->out_plugins);
     }
     flb_free(plugin_stname);
+
+    if (type == -1) {
+        flb_error("[plugin] plugin type not defined on '%s'", path);
+        dlclose(dso_handle);
+        return -1;
+    }
 
     /* Create plugin context (internal reference only) */
     plugin = flb_malloc(sizeof(struct flb_plugin));
@@ -297,13 +327,13 @@ int flb_plugin_load_config_file(const char *file, struct flb_config *config)
 {
     int ret;
     char tmp[PATH_MAX + 1];
-    const char *cfg = NULL;
-    struct mk_rconf *fconf;
-    struct mk_rconf_section *section;
-    struct mk_rconf_entry *entry;
+    char *cfg = NULL;
     struct mk_list *head;
     struct mk_list *head_e;
     struct stat st;
+    struct flb_cf *cf;
+    struct flb_cf_section *section;
+    struct flb_kv *entry;
 
 #ifndef FLB_HAVE_STATIC_CONF
     ret = stat(file, &st);
@@ -320,42 +350,43 @@ int flb_plugin_load_config_file(const char *file, struct flb_config *config)
         }
     }
     else {
-        cfg = file;
+        cfg = (char *) file;
     }
 
     flb_debug("[plugin] opening configuration file %s", cfg);
-    fconf = mk_rconf_open(cfg);
+
+    cf = flb_cf_create_from_file(NULL, cfg);
 #else
-    fconf = flb_config_static_open(file);
+    cf = flb_config_static_open(file);
 #endif
 
-    if (!fconf) {
+    if (!cf) {
         return -1;
     }
 
-    /* Read all [PLUGINS] sections */
-    mk_list_foreach(head, &fconf->sections) {
-        section = mk_list_entry(head, struct mk_rconf_section, _head);
-        if (strcasecmp(section->name, "PLUGINS") != 0) {
+    /* read all 'plugins' sections */
+    mk_list_foreach(head, &cf->sections) {
+        section = mk_list_entry(head, struct flb_cf_section, _head);
+        if (strcasecmp(section->name, "plugins") != 0) {
             continue;
         }
 
-        mk_list_foreach(head_e, &section->entries) {
-            entry = mk_list_entry(head_e, struct mk_rconf_entry, _head);
-            if (strcmp(entry->key, "Path") != 0) {
+        mk_list_foreach(head_e, &section->properties) {
+            entry = mk_list_entry(head_e, struct flb_kv, _head);
+            if (strcasecmp(entry->key, "path") != 0) {
                 continue;
             }
 
             /* Load plugin with router function */
             ret = flb_plugin_load_router(entry->val, config);
             if (ret == -1) {
-                mk_rconf_free(fconf);
+                flb_cf_destroy(cf);
                 return -1;
             }
         }
     }
 
-    mk_rconf_free(fconf);
+    flb_cf_destroy(cf);
     return 0;
 }
 

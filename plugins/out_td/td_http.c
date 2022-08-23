@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -18,23 +17,24 @@
  *  limitations under the License.
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-#include <fluent-bit/flb_info.h>
+#include <fluent-bit/flb_output_plugin.h>
 #include <fluent-bit/flb_gzip.h>
 #include <fluent-bit/flb_config.h>
 #include <fluent-bit/flb_http_client.h>
 
 #include "td_config.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+
 #define TD_HTTP_HEADER_SIZE  512
 
 struct flb_http_client *td_http_client(struct flb_upstream_conn *u_conn,
                                        void *data, size_t len,
                                        char **body,
-                                       struct flb_out_td_config *ctx,
+                                       struct flb_td *ctx,
                                        struct flb_config *config)
 {
     int ret;
@@ -48,7 +48,7 @@ struct flb_http_client *td_http_client(struct flb_upstream_conn *u_conn,
     /* Compress data */
     ret = flb_gzip_compress(data, len, &gz_data, &gz_size);
     if (ret == -1) {
-        flb_error("[td_http] error compressing data");
+        flb_plg_error(ctx->ins, "error compressing data");
         return NULL;
     }
 

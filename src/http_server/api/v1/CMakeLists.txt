@@ -2,8 +2,10 @@
 set(src
   uptime.c
   metrics.c
+  storage.c
   plugins.c
   register.c
+  health.c
   )
 
 include_directories(${MONKEY_INCLUDE_DIR})

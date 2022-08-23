@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -20,6 +19,7 @@
 
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_input.h>
+#include <fluent-bit/flb_input_plugin.h>
 #include <fluent-bit/flb_config.h>
 #include <fluent-bit/flb_error.h>
 #include <fluent-bit/flb_utils.h>
@@ -34,15 +34,16 @@
 #include "in_exec.h"
 
 /* cb_collect callback */
-static int in_exec_collect(struct flb_input_instance *i_ins,
+static int in_exec_collect(struct flb_input_instance *ins,
                            struct flb_config *config, void *in_context)
 {
     int ret = -1;
+    uint64_t val;
     size_t str_len = 0;
     FILE *cmdp = NULL;
-    struct flb_in_exec_config *exec_config = in_context;
     msgpack_packer mp_pck;
     msgpack_sbuffer mp_sbuf;
+    struct flb_exec *ctx = in_context;
 
     /* variables for parser */
     int parser_ret = -1;
@@ -50,22 +51,32 @@ static int in_exec_collect(struct flb_input_instance *i_ins,
     size_t out_size = 0;
     struct flb_time out_time;
 
-    cmdp = popen(exec_config->cmd, "r");
+    if (ctx->oneshot == FLB_TRUE) {
+        ret = flb_pipe_r(ctx->ch_manager[0], &val, sizeof(val));
+        if (ret == -1) {
+            flb_errno();
+            return -1;
+        }
+    }
+
+    cmdp = popen(ctx->cmd, "r");
     if (cmdp == NULL) {
-        flb_debug("[in_exec] %s failed", exec_config->cmd);
+        flb_plg_debug(ctx->ins, "command %s failed", ctx->cmd);
         goto collect_end;
     }
 
-    if (exec_config->parser) {
-        while (fgets(exec_config->buf, exec_config->buf_size, cmdp) != NULL) {
-            str_len = strnlen(exec_config->buf, exec_config->buf_size);
-            exec_config->buf[str_len - 1] = '\0'; /* chomp */
+    if (ctx->parser) {
+        while (fgets(ctx->buf, ctx->buf_size, cmdp) != NULL) {
+            str_len = strnlen(ctx->buf, ctx->buf_size);
+            if (ctx->buf[str_len - 1] == '\n') {
+                ctx->buf[--str_len] = '\0'; /* chomp */
+            }
 
             flb_time_get(&out_time);
-            parser_ret = flb_parser_do(exec_config->parser, exec_config->buf, str_len - 1,
+            parser_ret = flb_parser_do(ctx->parser, ctx->buf, str_len,
                                        &out_buf, &out_size, &out_time);
             if (parser_ret >= 0) {
-                if (flb_time_to_double(&out_time) == 0.0) {
+                if (flb_time_to_nanosec(&out_time) == 0L) {
                     flb_time_get(&out_time);
                 }
 
@@ -77,22 +88,24 @@ static int in_exec_collect(struct flb_input_instance *i_ins,
                 flb_time_append_to_msgpack(&out_time, &mp_pck, 0);
                 msgpack_sbuffer_write(&mp_sbuf, out_buf, out_size);
 
-                flb_input_chunk_append_raw(i_ins, NULL, 0,
+                flb_input_chunk_append_raw(ins, NULL, 0,
                                            mp_sbuf.data, mp_sbuf.size);
                 msgpack_sbuffer_destroy(&mp_sbuf);
                 flb_free(out_buf);
             }
             else {
-                flb_trace("[in_exec] tried to parse '%s'", exec_config->buf);
-                flb_trace("[in_exec] buf_size %zu", exec_config->buf_size);
-                flb_error("[in_exec] parser returned an error");
+                flb_plg_trace(ctx->ins, "tried to parse '%s'", ctx->buf);
+                flb_plg_trace(ctx->ins, "buf_size %zu", ctx->buf_size);
+                flb_plg_error(ctx->ins, "parser returned an error");
             }
         }
     }
     else {
-        while (fgets(exec_config->buf, exec_config->buf_size, cmdp) != NULL) {
-            str_len = strnlen(exec_config->buf, exec_config->buf_size);
-            exec_config->buf[str_len - 1] = '\0'; /* chomp */
+        while (fgets(ctx->buf, ctx->buf_size, cmdp) != NULL) {
+            str_len = strnlen(ctx->buf, ctx->buf_size);
+            if (ctx->buf[str_len - 1] == '\n') {
+                ctx->buf[--str_len] = '\0'; /* chomp */
+            }
 
             /* Initialize local msgpack buffer */
             msgpack_sbuffer_init(&mp_sbuf);
@@ -104,11 +117,11 @@ static int in_exec_collect(struct flb_input_instance *i_ins,
 
             msgpack_pack_str(&mp_pck, 4);
             msgpack_pack_str_body(&mp_pck, "exec", 4);
-            msgpack_pack_str(&mp_pck, str_len - 1);
+            msgpack_pack_str(&mp_pck, str_len);
             msgpack_pack_str_body(&mp_pck,
-                                  exec_config->buf, str_len - 1);
+                                  ctx->buf, str_len);
 
-            flb_input_chunk_append_raw(i_ins, NULL, 0,
+            flb_input_chunk_append_raw(ins, NULL, 0,
                                        mp_sbuf.data, mp_sbuf.size);
             msgpack_sbuffer_destroy(&mp_sbuf);
         }
@@ -125,148 +138,212 @@ static int in_exec_collect(struct flb_input_instance *i_ins,
 }
 
 /* read config file and*/
-static int in_exec_config_read(struct flb_in_exec_config *exec_config,
+static int in_exec_config_read(struct flb_exec *ctx,
                                struct flb_input_instance *in,
-                               struct flb_config *config,
-                               int *interval_sec,
-                               int *interval_nsec
+                               struct flb_config *config
 )
 {
-    const char *cmd = NULL;
-    const char *pval = NULL;
+    int ret;
 
-    /* filepath setting */
-    cmd = flb_input_get_property("command", in);
-    if (cmd == NULL) {
-        flb_error("[in_exec] no input 'command' was given");
+    ctx->ins = in;
+
+    /* Load the config map */
+    ret = flb_input_config_map_set(in, (void *)ctx);
+    if (ret == -1) {
+        flb_plg_error(in, "unable to load configuration");
         return -1;
     }
-    exec_config->cmd = cmd;
+   
+    /* filepath setting */
+    if (ctx->cmd == NULL) {
+        flb_plg_error(in, "no input 'command' was given");
+        return -1;
+    }
 
-    pval = flb_input_get_property("parser", in);
-    if (pval != NULL) {
-        exec_config->parser = flb_parser_get(pval, config);
-        if (exec_config->parser == NULL) {
-            flb_error("[in_exec] requested parser '%s' not found", pval);
+    if (ctx->parser_name != NULL) {
+        ctx->parser = flb_parser_get(ctx->parser_name, config);
+        if (ctx->parser == NULL) {
+            flb_plg_error(in, "requested parser '%s' not found", ctx->parser_name);
         }
     }
 
-    pval = flb_input_get_property("buf_size", in);
-    if (pval != NULL) {
-        exec_config->buf_size = (size_t) flb_utils_size_to_bytes(pval);
-
-        if (exec_config->buf_size == -1) {
-            flb_error("[in_exec] buffer size '%s' is invalid", pval);
-            return -1;
-        }
-    }
-    else {
-        exec_config->buf_size = DEFAULT_BUF_SIZE;
+    if (ctx->buf_size == -1) {
+        flb_plg_error(in, "buffer size is invalid");
+        return -1;
     }
 
-    /* interval settings */
-    pval = flb_input_get_property("interval_sec", in);
-    if (pval != NULL && atoi(pval) >= 0) {
-        *interval_sec = atoi(pval);
-    }
-    else {
-        *interval_sec = DEFAULT_INTERVAL_SEC;
-    }
-
-    pval = flb_input_get_property("interval_nsec", in);
-    if (pval != NULL && atoi(pval) >= 0) {
-        *interval_nsec = atoi(pval);
-    }
-    else {
-        *interval_nsec = DEFAULT_INTERVAL_NSEC;
-    }
-
-    if (*interval_sec <= 0 && *interval_nsec <= 0) {
+    if (ctx->interval_sec <= 0 && ctx->interval_nsec <= 0) {
         /* Illegal settings. Override them. */
-        *interval_sec = DEFAULT_INTERVAL_SEC;
-        *interval_nsec = DEFAULT_INTERVAL_NSEC;
+        ctx->interval_sec = atoi(DEFAULT_INTERVAL_SEC);
+        ctx->interval_nsec = atoi(DEFAULT_INTERVAL_NSEC);
     }
 
-    flb_debug("[in_exec] interval_sec=%d interval_nsec=%d",
-              *interval_sec, *interval_nsec);
+    if (ctx->oneshot) {
+        ctx->interval_sec = -1;
+        ctx->interval_nsec = -1;
+    }
+
+    flb_plg_debug(in, "interval_sec=%d interval_nsec=%d oneshot=%i buf_size=%d",
+              ctx->interval_sec, ctx->interval_nsec, ctx->oneshot, ctx->buf_size);
 
     return 0;
 }
 
-static void delete_exec_config(struct flb_in_exec_config *exec_config)
+static void delete_exec_config(struct flb_exec *ctx)
 {
-    if (exec_config) {
-        /* release buffer */
-        if (exec_config->buf != NULL) {
-            flb_free(exec_config->buf);
-        }
-        flb_free(exec_config);
+    if (!ctx) {
+        return;
     }
+
+    /* release buffer */
+    if (ctx->buf != NULL) {
+        flb_free(ctx->buf);
+    }
+
+    if (ctx->ch_manager[0] > -1) {
+        flb_pipe_close(ctx->ch_manager[0]);
+    }
+
+    if (ctx->ch_manager[1] > -1) {
+        flb_pipe_close(ctx->ch_manager[1]);
+    }
+
+    flb_free(ctx);
 }
 
 /* Initialize plugin */
 static int in_exec_init(struct flb_input_instance *in,
                         struct flb_config *config, void *data)
 {
-    struct flb_in_exec_config *exec_config = NULL;
+    struct flb_exec *ctx = NULL;
     int ret = -1;
-    int interval_sec = 0;
-    int interval_nsec = 0;
 
     /* Allocate space for the configuration */
-    exec_config = flb_malloc(sizeof(struct flb_in_exec_config));
-    if (exec_config == NULL) {
+    ctx = flb_calloc(1, sizeof(struct flb_exec));
+    if (!ctx) {
         return -1;
     }
-    exec_config->parser = NULL;
+    ctx->parser = NULL;
 
     /* Initialize exec config */
-    ret = in_exec_config_read(exec_config, in, config, &interval_sec, &interval_nsec);
+    ret = in_exec_config_read(ctx, in, config);
     if (ret < 0) {
         goto init_error;
     }
 
-    exec_config->buf = flb_malloc(exec_config->buf_size);
-    if (exec_config->buf == NULL) {
-        flb_error("could not allocate exec buffer");
+    ctx->buf = flb_malloc(ctx->buf_size);
+    if (ctx->buf == NULL) {
+        flb_plg_error(in, "could not allocate exec buffer");
         goto init_error;
     }
 
-    flb_input_set_context(in, exec_config);
+    flb_input_set_context(in, ctx);
 
-    ret = flb_input_set_collector_time(in,
-                                       in_exec_collect,
-                                       interval_sec,
-                                       interval_nsec, config);
+    ctx->ch_manager[0] = -1;
+    ctx->ch_manager[1] = -1;
+
+    if (ctx->oneshot == FLB_TRUE) {
+        if (flb_pipe_create(ctx->ch_manager)) {
+            flb_plg_error(in, "could not create pipe for oneshot command");
+            goto init_error;
+        }
+
+        ret = flb_input_set_collector_event(in,
+                                            in_exec_collect,
+                                            ctx->ch_manager[0], config);
+    }
+    else {
+        ret = flb_input_set_collector_time(in,
+                                           in_exec_collect,
+                                           ctx->interval_sec,
+                                           ctx->interval_nsec, config);
+    }
     if (ret < 0) {
-        flb_error("could not set collector for exec input plugin");
+        flb_plg_error(in, "could not set collector for exec input plugin");
         goto init_error;
     }
 
     return 0;
 
   init_error:
-    delete_exec_config(exec_config);
+    delete_exec_config(ctx);
 
     return -1;
+}
+
+static int in_exec_prerun(struct flb_input_instance *ins,
+                          struct flb_config *config, void *in_context)
+{
+    int ret;
+    uint64_t val = 0xc003;  /* dummy constant */
+    struct flb_exec *ctx = in_context;
+    (void) ins;
+    (void) config;
+
+    if (ctx->oneshot == FLB_FALSE) {
+        return 0;
+    }
+
+    /* Kick the oneshot execution */
+    ret = flb_pipe_w(ctx->ch_manager[1], &val, sizeof(val));
+    if (ret == -1) {
+        flb_errno();
+        return -1;
+    }
+    return 0;
 }
 
 static int in_exec_exit(void *data, struct flb_config *config)
 {
     (void) *config;
-    struct flb_in_exec_config *exec_config = data;
+    struct flb_exec *ctx = data;
 
-    delete_exec_config(exec_config);
+    delete_exec_config(ctx);
     return 0;
 }
 
+static struct flb_config_map config_map[] = {
+    {
+     FLB_CONFIG_MAP_STR, "command", NULL,
+     0, FLB_TRUE, offsetof(struct flb_exec, cmd),
+     "Set the command to execute"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "parser", NULL,
+     0, FLB_TRUE, offsetof(struct flb_exec, parser_name),
+     "Set a parser"
+    },
+    {
+      FLB_CONFIG_MAP_INT, "interval_sec", DEFAULT_INTERVAL_SEC,
+      0, FLB_TRUE, offsetof(struct flb_exec, interval_sec),
+      "Set the collector interval"
+    },
+    {
+      FLB_CONFIG_MAP_INT, "interval_nsec", DEFAULT_INTERVAL_NSEC,
+      0, FLB_TRUE, offsetof(struct flb_exec, interval_nsec),
+      "Set the collector interval (nanoseconds)"
+    },
+    {
+      FLB_CONFIG_MAP_SIZE, "buf_size", DEFAULT_BUF_SIZE,
+      0, FLB_TRUE, offsetof(struct flb_exec, buf_size),
+      "Set the buffer size"
+    },
+    {
+      FLB_CONFIG_MAP_BOOL, "oneshot", "false",
+      0, FLB_TRUE, offsetof(struct flb_exec, oneshot),
+      "execute the command only once"
+    },
+    /* EOF */
+    {0}
+};
 
 struct flb_input_plugin in_exec_plugin = {
     .name         = "exec",
     .description  = "Exec Input",
     .cb_init      = in_exec_init,
-    .cb_pre_run   = NULL,
+    .cb_pre_run   = in_exec_prerun,
     .cb_collect   = in_exec_collect,
     .cb_flush_buf = NULL,
-    .cb_exit      = in_exec_exit
+    .cb_exit      = in_exec_exit,
+    .config_map   = config_map
 };

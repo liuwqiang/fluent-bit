@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -18,13 +17,7 @@
  *  limitations under the License.
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <assert.h>
-#include <errno.h>
-
-#include <fluent-bit/flb_info.h>
-#include <fluent-bit/flb_output.h>
+#include <fluent-bit/flb_output_plugin.h>
 #include <fluent-bit/flb_network.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_http_client.h>
@@ -35,7 +28,10 @@
 #include "td_http.h"
 #include "td_config.h"
 
-struct flb_output_plugin out_td_plugin;
+#include <stdio.h>
+#include <stdlib.h>
+#include <assert.h>
+#include <errno.h>
 
 /*
  * Convert the internal Fluent Bit data representation to the required
@@ -71,6 +67,7 @@ static char *td_format(const void *data, size_t bytes, int *out_size)
     /* Perform some format validation */
     ret = msgpack_unpack_next(&result, data, bytes, &off);
     if (ret == MSGPACK_UNPACK_CONTINUE) {
+        msgpack_unpacked_destroy(&result);
         return NULL;
     }
 
@@ -82,16 +79,20 @@ static char *td_format(const void *data, size_t bytes, int *out_size)
          */
         buf = flb_malloc(bytes);
         if (!buf) {
+            flb_errno();
+            msgpack_unpacked_destroy(&result);
             return NULL;
         }
 
         memcpy(buf, data, bytes);
         *out_size = bytes;
+        msgpack_unpacked_destroy(&result);
         return buf;
     }
 
     root = result.data;
     if (root.via.array.size == 0) {
+        msgpack_unpacked_destroy(&result);
         return NULL;
     }
 
@@ -132,6 +133,7 @@ static char *td_format(const void *data, size_t bytes, int *out_size)
     *out_size = sbuf->size;
     buf = flb_malloc(sbuf->size);
     if (!buf) {
+        flb_errno();
         return NULL;
     }
 
@@ -142,43 +144,43 @@ static char *td_format(const void *data, size_t bytes, int *out_size)
     return buf;
 }
 
-int cb_td_init(struct flb_output_instance *ins, struct flb_config *config,
-               void *data)
+static int cb_td_init(struct flb_output_instance *ins, struct flb_config *config,
+                      void *data)
 {
-    struct flb_out_td_config *ctx;
+    struct flb_td *ctx;
     struct flb_upstream *upstream;
     (void) data;
 
     ctx = td_config_init(ins);
     if (!ctx) {
-        flb_warn("[out_td] Error reading configuration");
+        flb_plg_warn(ins, "Error reading configuration");
         return -1;
     }
 
     if (ctx->region == FLB_TD_REGION_US) {
-        ins->host.name = flb_strdup("api.treasuredata.com");
+        flb_output_net_default("api.treasuredata.com", 443, ins);
     }
     else if (ctx->region == FLB_TD_REGION_JP) {
-        ins->host.name = flb_strdup("api.treasuredata.co.jp");
+        flb_output_net_default("api.treasuredata.co.jp", 443, ins);
     }
-    ins->host.port = 443;
 
     upstream = flb_upstream_create(config,
                                    ins->host.name,
                                    ins->host.port,
-                                   FLB_IO_TLS, (void *) &ins->tls);
+                                   FLB_IO_TLS, ins->tls);
     if (!upstream) {
         flb_free(ctx);
         return -1;
     }
     ctx->u = upstream;
+    flb_output_upstream_set(ctx->u, ins);
 
     flb_output_set_context(ins, ctx);
     return 0;
 }
 
-static void cb_td_flush(const void *data, size_t bytes,
-                        const char *tag, int tag_len,
+static void cb_td_flush(struct flb_event_chunk *event_chunk,
+                        struct flb_output_flush *out_flush,
                         struct flb_input_instance *i_ins,
                         void *out_context,
                         struct flb_config *config)
@@ -188,15 +190,13 @@ static void cb_td_flush(const void *data, size_t bytes,
     char *pack;
     size_t b_sent;
     char *body = NULL;
-    struct flb_out_td_config *ctx = out_context;
+    struct flb_td *ctx = out_context;
     struct flb_upstream_conn *u_conn;
     struct flb_http_client *c;
     (void) i_ins;
-    (void) tag;
-    (void) tag_len;
 
     /* Convert format */
-    pack = td_format(data, bytes, &bytes_out);
+    pack = td_format(event_chunk->data, event_chunk->size, &bytes_out);
     if (!pack) {
         FLB_OUTPUT_RETURN(FLB_ERROR);
     }
@@ -204,7 +204,7 @@ static void cb_td_flush(const void *data, size_t bytes,
     /* Lookup an available connection context */
     u_conn = flb_upstream_conn_get(ctx->u);
     if (!u_conn) {
-        flb_error("[out_td] no upstream connections available");
+        flb_plg_error(ctx->ins, "no upstream connections available");
         flb_free(pack);
         FLB_OUTPUT_RETURN(FLB_RETRY);
     }
@@ -229,20 +229,20 @@ static void cb_td_flush(const void *data, size_t bytes,
         /* We expect a HTTP 200 OK */
         if (c->resp.status != 200) {
             if (c->resp.payload_size > 0) {
-                flb_warn("[out_td] HTTP status %i\n%s",
-                         c->resp.status, c->resp.payload);
+                flb_plg_warn(ctx->ins, "HTTP status %i\n%s",
+                             c->resp.status, c->resp.payload);
             }
             else {
-                flb_warn("[out_td] HTTP status %i", c->resp.status);
+                flb_plg_warn(ctx->ins, "HTTP status %i", c->resp.status);
             }
             goto retry;
         }
         else {
-            flb_info("[out_td] HTTP status 200 OK");
+            flb_plg_info(ctx->ins, "HTTP status 200 OK");
         }
     }
     else {
-        flb_error("[out_td] http_do=%i", ret);
+        flb_plg_error(ctx->ins, "http_do=%i", ret);
         goto retry;
     }
 
@@ -259,15 +259,44 @@ static void cb_td_flush(const void *data, size_t bytes,
     FLB_OUTPUT_RETURN(FLB_RETRY);
 }
 
-int cb_td_exit(void *data, struct flb_config *config)
+static int cb_td_exit(void *data, struct flb_config *config)
 {
-    struct flb_out_td_config *ctx = data;
+    struct flb_td *ctx = data;
+
+    if (!ctx) {
+        return 0;
+    }
 
     flb_upstream_destroy(ctx->u);
     flb_free(ctx);
 
     return 0;
 }
+
+static struct flb_config_map config_map[] = {
+    {
+      FLB_CONFIG_MAP_STR, "API", (char *)NULL,
+      0, FLB_TRUE, offsetof(struct flb_td, api),
+      "Set the API key"
+    },
+    {
+      FLB_CONFIG_MAP_STR, "Database", (char *)NULL,
+      0, FLB_TRUE, offsetof(struct flb_td, db_name),
+      "Set the Database file"
+    },
+    {
+      FLB_CONFIG_MAP_STR, "Table", (char *)NULL,
+      0, FLB_TRUE, offsetof(struct flb_td, db_table),
+      "Set the Database Table"
+    },
+    {
+      FLB_CONFIG_MAP_STR, "Region", (char *)NULL,
+      0, FLB_TRUE, offsetof(struct flb_td, region_str),
+      "Set the Region: us or jp"
+    },
+    /* EOF */
+    {0}
+};
 
 /* Plugin reference */
 struct flb_output_plugin out_td_plugin = {
@@ -277,5 +306,6 @@ struct flb_output_plugin out_td_plugin = {
     .cb_pre_run     = NULL,
     .cb_flush       = cb_td_flush,
     .cb_exit        = cb_td_exit,
+    .config_map     = config_map,
     .flags          = FLB_IO_TLS,
 };

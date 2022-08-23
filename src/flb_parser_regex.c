@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -55,7 +54,7 @@ static void cb_results(const char *name, const char *value,
     struct tm tm = {0};
     (void) data;
 
-    if (vlen == 0) {
+    if (vlen == 0 && parser->skip_empty) {
         pcb->num_skipped++;
         return;
     }
@@ -81,8 +80,8 @@ static void cb_results(const char *name, const char *value,
                 }
                 memcpy(tmp, value, vlen);
                 tmp[vlen] = '\0';
-                flb_warn("[parser:%s] Invalid time format %s for '%s'.",
-                         parser->name, parser->time_fmt, tmp);
+                flb_warn("[parser:%s] invalid time format %s for '%s'",
+                         parser->name, parser->time_fmt_full, tmp);
                 pcb->num_skipped++;
                 return;
             }
@@ -149,7 +148,7 @@ int flb_parser_regex_do(struct flb_parser *parser,
     pcb.num_skipped = 0;
     pcb.time_lookup = 0;
     pcb.time_frac = 0;
-    pcb.time_now = time(NULL);
+    pcb.time_now = 0;
 
     /* Iterate results and compose new buffer */
     last_byte = flb_regex_parse(parser->regex, &result, cb_results, &pcb);

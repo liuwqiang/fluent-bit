@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -19,7 +18,7 @@
  */
 
 #include <fluent-bit/flb_info.h>
-#include <fluent-bit/flb_hash.h>
+#include <fluent-bit/flb_hash_table.h>
 #include <fluent-bit/flb_mem.h>
 #include <fluent-bit/flb_log.h>
 #include <fluent-bit/flb_str.h>
@@ -70,7 +69,7 @@ static int env_preset(struct flb_env *env)
 struct flb_env *flb_env_create()
 {
     struct flb_env *env;
-    struct flb_hash *ht;
+    struct flb_hash_table *ht;
 
     env = flb_malloc(sizeof(struct flb_env));
     if (!env) {
@@ -79,12 +78,13 @@ struct flb_env *flb_env_create()
     }
 
     /* Create the hash-table */
-    ht = flb_hash_create(FLB_HASH_EVICT_NONE, FLB_ENV_SIZE, -1);
+    ht = flb_hash_table_create(FLB_HASH_TABLE_EVICT_NONE, FLB_ENV_SIZE, -1);
     if (!ht) {
         flb_free(env);
         return NULL;
     }
 
+    env->warn_unused = FLB_TRUE;
     env->ht = ht;
     env_preset(env);
 
@@ -93,7 +93,7 @@ struct flb_env *flb_env_create()
 
 void flb_env_destroy(struct flb_env *env)
 {
-    flb_hash_destroy(env->ht);
+    flb_hash_table_destroy(env->ht);
     flb_free(env);
 }
 
@@ -102,7 +102,7 @@ int flb_env_set(struct flb_env *env, const char *key, const char *val)
     int id;
     int klen;
     int vlen;
-    const char *out_buf;
+    void *out_buf;
     size_t out_size;
 
     /* Get lengths */
@@ -110,14 +110,14 @@ int flb_env_set(struct flb_env *env, const char *key, const char *val)
     vlen = strlen(val);
 
     /* Check if the key is already set */
-    id = flb_hash_get(env->ht, key, klen, &out_buf, &out_size);
+    id = flb_hash_table_get(env->ht, key, klen, &out_buf, &out_size);
     if (id >= 0) {
         /* Remove the old entry */
-        flb_hash_del(env->ht, key);
+        flb_hash_table_del(env->ht, key);
     }
 
     /* Register the new key */
-    id = flb_hash_add(env->ht, key, klen, val, vlen);
+    id = flb_hash_table_add(env->ht, key, klen, (void *) val, vlen);
     return id;
 }
 
@@ -125,7 +125,7 @@ const char *flb_env_get(struct flb_env *env, const char *key)
 {
     int len;
     int ret;
-    const char *out_buf;
+    void *out_buf;
     size_t out_size;
 
     if (!key) {
@@ -135,19 +135,22 @@ const char *flb_env_get(struct flb_env *env, const char *key)
     len = strlen(key);
 
     /* Try to get the value from the hash table */
-    ret = flb_hash_get(env->ht, key, len, &out_buf, &out_size);
+    ret = flb_hash_table_get(env->ht, key, len, &out_buf, &out_size);
     if (ret >= 0) {
-        return out_buf;
+        return (char *) out_buf;
     }
 
     /* If it was not found, try to get it from the real environment */
     out_buf = getenv(key);
     if (!out_buf) {
-        flb_warn("[env] variable ${%s} is used but not set", key);
         return NULL;
     }
 
-    return out_buf;
+    if (strlen(out_buf) == 0) {
+        return NULL;
+    }
+
+    return (char *) out_buf;
 }
 
 /*
@@ -226,6 +229,9 @@ flb_sds_t flb_env_var_translate(struct flb_env *env, const char *value)
             if (s != buf) {
                 buf = s;
             }
+        }
+        else if (env->warn_unused == FLB_TRUE) {
+            flb_warn("[env] variable ${%s} is used but not set", tmp);
         }
         i += (v_start - (value + i)) + v_len;
     }

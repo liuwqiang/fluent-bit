@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -35,9 +34,11 @@
 #include <sys/socket.h>
 #define flb_sockfd_t         int
 #define flb_socket_close(fd) close(fd)
-#define flb_socket_error(fd) errno
 #define FLB_EINPROGRESS(e)   ((e) == EINTR || (e) == EINPROGRESS)
 #define FLB_WOULDBLOCK()     (errno == EAGAIN || errno == EWOULDBLOCK)
+
+int flb_socket_error(int fd);
+
 #endif
 
 #endif

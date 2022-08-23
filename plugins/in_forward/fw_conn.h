@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -21,7 +20,8 @@
 #ifndef FLB_IN_FW_CONN_H
 #define FLB_IN_FW_CONN_H
 
-#define FLB_IN_FW_CHUNK 32768
+#define FLB_IN_FW_CHUNK_SIZE      "1024000" /* 1MB */
+#define FLB_IN_FW_CHUNK_MAX_SIZE  "6144000" /* =FLB_IN_FW_CHUNK_SIZE * 6.  6MB */
 
 enum {
     FW_NEW        = 1,  /* it's a new connection                */
@@ -53,5 +53,6 @@ struct fw_conn {
 
 struct fw_conn *fw_conn_add(int fd, struct flb_in_fw_config *ctx);
 int fw_conn_del(struct fw_conn *conn);
+int fw_conn_del_all(struct flb_in_fw_config *ctx);
 
 #endif

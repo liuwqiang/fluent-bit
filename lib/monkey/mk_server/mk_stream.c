@@ -35,6 +35,12 @@ struct mk_channel *mk_channel_new(int type, int fd)
     return channel;
 }
 
+int mk_channel_release(struct mk_channel *channel)
+{
+    mk_mem_free(channel);
+    return 0;
+}
+
 static inline size_t channel_write_in_file(struct mk_channel *channel,
                                            struct mk_stream_input *in)
 {
@@ -75,7 +81,7 @@ int mk_channel_flush(struct mk_channel *channel)
         ret = mk_channel_write(channel, &count);
         total += count;
 
-#ifdef TRACE
+#ifdef MK_HAVE_TRACE
         MK_TRACE("Channel flush: %d bytes", count);
         if (ret & MK_CHANNEL_DONE) {
             MK_TRACE("Channel was empty");

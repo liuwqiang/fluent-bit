@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -33,12 +32,21 @@ struct flb_kernel *flb_kernel_info()
 
     kernel = flb_malloc(sizeof(struct flb_kernel));
     if (!kernel) {
+        flb_errno();
         return NULL;
     }
+
     kernel->minor = 0;
     kernel->major = 0;
     kernel->patch = 0;
     kernel->s_version.data = flb_malloc(16);
+
+    if (!kernel->s_version.data) {
+        flb_errno();
+        flb_free(kernel);
+        return NULL;
+    }
+
 
     len = snprintf(kernel->s_version.data, 16, "0.0.0");
     if (len == -1) {
@@ -70,7 +78,7 @@ struct flb_kernel *flb_kernel_info()
     struct flb_kernel *kernel;
 
     if (uname(&uts) == -1) {
-        perror("uname");
+        flb_errno();
         return NULL;
     }
     len = strlen(uts.release);
@@ -111,6 +119,7 @@ struct flb_kernel *flb_kernel_info()
 
     kernel = flb_malloc(sizeof(struct flb_kernel));
     if (!kernel) {
+        flb_errno();
         return NULL;
     }
     kernel->minor = a;
@@ -118,9 +127,16 @@ struct flb_kernel *flb_kernel_info()
     kernel->patch = c;
     kernel->s_version.data = flb_malloc(16);
 
+    if (!kernel->s_version.data) {
+        flb_errno();
+        flb_free(kernel);
+        return NULL;
+    }
+
     len = snprintf(kernel->s_version.data, 16, "%i.%i.%i", a, b, c);
     if (len == -1) {
-        perror("snprintf");
+        flb_errno();
+        flb_free(kernel->s_version.data);
         flb_free(kernel);
         return NULL;
     }

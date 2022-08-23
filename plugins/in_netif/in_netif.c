@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -18,7 +17,7 @@
  *  limitations under the License.
  */
 
-#include <fluent-bit/flb_info.h>
+#include <fluent-bit/flb_input_plugin.h>
 #include <fluent-bit/flb_config.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_pack.h>
@@ -26,8 +25,6 @@
 
 #include <stdio.h>
 #include "in_netif.h"
-
-
 
 struct entry_define entry_name_linux[] = {
     {"rx.bytes",       FLB_TRUE},
@@ -73,7 +70,12 @@ static int init_entry_linux(struct flb_in_netif_config *ctx)
 
     ctx->entry_len = sizeof(entry_name_linux) / sizeof(struct entry_define);
     ctx->entry = flb_malloc(sizeof(struct netif_entry) * ctx->entry_len);
-    for(i=0; i<ctx->entry_len; i++) {
+    if (!ctx->entry) {
+        flb_errno();
+        return -1;
+    }
+
+    for(i = 0; i < ctx->entry_len; i++) {
         ctx->entry[i].name     = entry_name_linux[i].name;
         ctx->entry[i].name_len = strlen(entry_name_linux[i].name);
         ctx->entry[i].prev     = 0;
@@ -92,62 +94,40 @@ static int init_entry_linux(struct flb_in_netif_config *ctx)
 }
 
 static int configure(struct flb_in_netif_config *ctx,
-                     struct flb_input_instance *in,
-                     int *interval_sec,
-                     int *interval_nsec)
+                     struct flb_input_instance *in)
 {
-    const char *pval = NULL;
+    int ret;
     ctx->map_num = 0;
 
-    /* interval settings */
-    pval = flb_input_get_property("interval_sec", in);
-    if (pval != NULL && atoi(pval) >= 0) {
-        *interval_sec = atoi(pval);
-    }
-    else {
-        *interval_sec = DEFAULT_INTERVAL_SEC;
+    /* Load the config map */
+    ret = flb_input_config_map_set(in, (void *)ctx);
+    if (ret == -1) {
+        flb_plg_error(in, "unable to load configuration");
+        return -1;
     }
 
-    pval = flb_input_get_property("interval_nsec", in);
-    if (pval != NULL && atoi(pval) >= 0) {
-        *interval_nsec = atoi(pval);
-    }
-    else {
-        *interval_nsec = DEFAULT_INTERVAL_NSEC;
-    }
-
-    if (*interval_sec <= 0 && *interval_nsec <= 0) {
+    if (ctx->interval_sec <= 0 && ctx->interval_nsec <= 0) {
         /* Illegal settings. Override them. */
-        *interval_sec = DEFAULT_INTERVAL_SEC;
-        *interval_nsec = DEFAULT_INTERVAL_NSEC;
+        ctx->interval_sec = atoi(DEFAULT_INTERVAL_SEC);
+        ctx->interval_nsec = atoi(DEFAULT_INTERVAL_NSEC);
     }
 
-    pval = flb_input_get_property("verbose", in);
-    if (pval != NULL && flb_utils_bool(pval)) {
-        ctx->verbose = FLB_TRUE;
-    }
-    else {
-        ctx->verbose = FLB_FALSE;
-    }
-
-    ctx->interface = flb_input_get_property("interface", in);
     if (ctx->interface == NULL) {
-        flb_error("[in_netif] \"interface\" is not set");
+        flb_plg_error(ctx->ins, "'interface' is not set");
         return -1;
     }
     ctx->interface_len = strlen(ctx->interface);
 
     ctx->first_snapshot = FLB_TRUE;    /* assign first_snapshot with FLB_TRUE */
 
-    init_entry_linux(ctx);
-
-    return 0;
+    return init_entry_linux(ctx);
 }
 
 static inline int is_specific_interface(struct flb_in_netif_config *ctx,
                                         char* interface)
 {
-    if (ctx->interface != NULL && !strncmp(ctx->interface, interface, ctx->interface_len)) {
+    if (ctx->interface != NULL &&
+        !strncmp(ctx->interface, interface, ctx->interface_len)) {
         return FLB_TRUE;
     }
     return FLB_FALSE;
@@ -204,12 +184,34 @@ static inline uint64_t calc_diff(struct netif_entry *entry)
 }
 
 #define LINE_LEN 256
+static int read_proc_file_linux(struct flb_in_netif_config *ctx)
+{
+    FILE *fp = NULL;
+    char line[LINE_LEN] = {0};
+    int interface_found = FLB_FALSE;
+
+    fp = fopen("/proc/net/dev", "r");
+    if (fp == NULL) {
+        flb_errno();
+        flb_plg_error(ctx->ins, "cannot open /proc/net/dev");
+        return -1;
+    }
+    while(fgets(line, LINE_LEN-1, fp) != NULL){
+        if(parse_proc_line(line, ctx) == 0) {
+            interface_found = FLB_TRUE;
+        }
+    }
+    fclose(fp);
+    if (interface_found != FLB_TRUE) {
+        return -1;
+    }
+    return 0;
+}
+
 static int in_netif_collect_linux(struct flb_input_instance *i_ins,
                            struct flb_config *config, void *in_context)
 {
     struct flb_in_netif_config *ctx = in_context;
-    FILE *fp = NULL;
-    char line[LINE_LEN] = {0};
     char key_name[LINE_LEN] = {0};
     int  key_len;
     int i;
@@ -217,14 +219,7 @@ static int in_netif_collect_linux(struct flb_input_instance *i_ins,
     msgpack_packer mp_pck;
     msgpack_sbuffer mp_sbuf;
 
-    fp = fopen("/proc/net/dev", "r");
-    if (fp == NULL) {
-        flb_error("[in_netif]fopen error\n");
-        return -1;
-    }
-    while(fgets(line, LINE_LEN-1, fp) != NULL){
-        parse_proc_line(line, ctx);
-    }
+    read_proc_file_linux(ctx);
 
     if (ctx->first_snapshot == FLB_TRUE) {
         /* if in_netif are called for the first time, assign prev with now */
@@ -264,22 +259,19 @@ static int in_netif_collect_linux(struct flb_input_instance *i_ins,
         msgpack_sbuffer_destroy(&mp_sbuf);
     }
 
-    fclose(fp);
     return 0;
 }
 
 static int in_netif_collect(struct flb_input_instance *i_ins,
-                           struct flb_config *config, void *in_context)
+                            struct flb_config *config, void *in_context)
 {
     return in_netif_collect_linux(i_ins, config, in_context);
 }
 
 static int in_netif_init(struct flb_input_instance *in,
-                          struct flb_config *config, void *data)
+                         struct flb_config *config, void *data)
 {
     int ret;
-    int interval_sec = 0;
-    int interval_nsec = 0;
 
     struct flb_in_netif_config *ctx = NULL;
     (void) data;
@@ -287,13 +279,26 @@ static int in_netif_init(struct flb_input_instance *in,
     /* Allocate space for the configuration */
     ctx = flb_calloc(1, sizeof(struct flb_in_netif_config));
     if (!ctx) {
-        perror("calloc");
+        flb_errno();
+        return -1;
+    }
+    ctx->ins = in;
+
+    if (configure(ctx, in) < 0) {
+        config_destroy(ctx);
         return -1;
     }
 
-    if (configure(ctx, in, &interval_sec, &interval_nsec) < 0) {
-        config_destroy(ctx);
-        return -1;
+    /* Testing interface */
+    if (ctx->test_at_init == FLB_TRUE) {
+        /* Try to read procfs */
+        ret = read_proc_file_linux(ctx);
+        if (ret < 0) {
+            flb_plg_error(in, "%s: init test failed", ctx->interface);
+            config_destroy(ctx);
+            return -1;
+        }
+        flb_plg_info(in, "%s: init test passed", ctx->interface);
     }
 
     /* Set the context */
@@ -302,17 +307,47 @@ static int in_netif_init(struct flb_input_instance *in,
     /* Set our collector based on time */
     ret = flb_input_set_collector_time(in,
                                        in_netif_collect,
-                                       interval_sec,
-                                       interval_nsec,
+                                       ctx->interval_sec,
+                                       ctx->interval_nsec,
                                        config);
     if (ret == -1) {
-        flb_error("Could not set collector for Proc input plugin");
+        flb_plg_error(ctx->ins, "Could not set collector for Proc input plugin");
         config_destroy(ctx);
         return -1;
     }
 
     return 0;
 }
+
+static struct flb_config_map config_map[] = {
+    {
+      FLB_CONFIG_MAP_STR, "interface", (char *)NULL,
+      0, FLB_TRUE, offsetof(struct flb_in_netif_config, interface),
+      "Set the interface, eg: eth0 or enp1s0"
+    },
+    {
+      FLB_CONFIG_MAP_INT, "interval_sec", DEFAULT_INTERVAL_SEC,
+      0, FLB_TRUE, offsetof(struct flb_in_netif_config, interval_sec),
+      "Set the collector interval"
+    },
+    {
+      FLB_CONFIG_MAP_INT, "interval_nsec", DEFAULT_INTERVAL_NSEC,
+      0, FLB_TRUE, offsetof(struct flb_in_netif_config, interval_nsec),
+      "Set the collector interval (nanoseconds)"
+    },
+    {
+      FLB_CONFIG_MAP_BOOL, "verbose", "false",
+      0, FLB_TRUE, offsetof(struct flb_in_netif_config, verbose),
+      "Enable verbosity"
+    },
+    {
+      FLB_CONFIG_MAP_BOOL, "test_at_init", "false",
+      0, FLB_TRUE, offsetof(struct flb_in_netif_config, test_at_init),
+      "Testing interface at initialization"
+    },
+    /* EOF */
+    {0}
+};
 
 /* Plugin reference */
 struct flb_input_plugin in_netif_plugin = {
@@ -323,5 +358,6 @@ struct flb_input_plugin in_netif_plugin = {
     .cb_collect   = in_netif_collect,
     .cb_flush_buf = NULL,
     .cb_exit      = in_netif_exit,
+    .config_map   = config_map,
     .flags        = 0,
 };

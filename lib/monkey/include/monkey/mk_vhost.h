@@ -102,9 +102,6 @@ struct vhost_fdt_host {
     struct mk_list _head;
 };
 
-//pthread_key_t mk_vhost_fdt_key;
-pthread_mutex_t mk_vhost_fdt_mutex;
-
 struct mk_vhost *mk_vhost_read(char *path);
 int mk_vhost_get(mk_ptr_t host, struct mk_vhost **vhost, struct
                  mk_vhost_alias **alias,
@@ -122,5 +119,5 @@ struct mk_vhost_handler *mk_vhost_handler_match(char *match,
                                                 void (*cb)(struct mk_http_request *,
                                                            void *),
                                                 void *data);
-
+int mk_vhost_destroy(struct mk_vhost *vh);
 #endif

@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -20,6 +19,7 @@
 
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_input.h>
+#include <fluent-bit/flb_input_plugin.h>
 #include <fluent-bit/flb_kernel.h>
 #include <fluent-bit/flb_pack.h>
 
@@ -31,27 +31,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
+#include "mem.h"
 #include "proc.h"
-
-#define DEFAULT_INTERVAL_SEC  1
-#define DEFAULT_INTERVAL_NSEC 0
-
-struct flb_in_mem_config {
-    int    idx;
-    int    page_size;
-    int    interval_sec;
-    int    interval_nsec;
-    pid_t  pid;
-};
-
-struct flb_in_mem_info {
-    uint64_t mem_total;
-    uint64_t mem_used;
-    uint64_t mem_free;
-    uint64_t swap_total;
-    uint64_t swap_used;
-    uint64_t swap_free;
-};
 
 struct flb_input_plugin in_mem_plugin;
 
@@ -92,8 +73,10 @@ static uint64_t calc_kb(unsigned long amount, unsigned int unit)
 {
     unsigned long long bytes = amount;
 
-    /* Recent Linux versions return memory/swap sizes as multiples */
-    /*     of a certain size unit. See sysinfo(2) for details. */
+    /*
+     * Recent Linux versions return memory/swap sizes as multiples
+     * of a certain size unit. See sysinfo(2) for details.
+     */
     if (unit > 1) {
         bytes = bytes * unit;
     }
@@ -110,15 +93,17 @@ static int mem_calc(struct flb_in_mem_info *m_info)
 
     ret = sysinfo(&info);
     if (ret == -1) {
-        perror("sysinfo");
+        flb_errno();
         return -1;
     }
 
     /* set values in KBs */
     m_info->mem_total     = calc_kb(info.totalram, info.mem_unit);
 
-    /* This value seems to be MemAvailable if it is supported */
-    /*     or MemFree on legacy linux */
+    /*
+     * This value seems to be MemAvailable if it is supported
+     * or MemFree on legacy Linux.
+     */
     m_info->mem_free      = calc_kb(info.freeram, info.mem_unit);
 
     m_info->mem_used      = m_info->mem_total - m_info->mem_free;
@@ -134,10 +119,8 @@ static int in_mem_init(struct flb_input_instance *in,
                        struct flb_config *config, void *data)
 {
     int ret;
-    const char *tmp;
     struct flb_in_mem_config *ctx;
     (void) data;
-    const char *pval = NULL;
 
     /* Initialize context */
     ctx = flb_malloc(sizeof(struct flb_in_mem_config));
@@ -147,21 +130,21 @@ static int in_mem_init(struct flb_input_instance *in,
     ctx->idx = 0;
     ctx->pid = 0;
     ctx->page_size = sysconf(_SC_PAGESIZE);
+    ctx->ins = in;
+    
+    /* Load the config map */
+    ret = flb_input_config_map_set(in, (void *)ctx);
+    if (ret == -1) {
+        flb_free(ctx);
+        return -1;
+    }
 
     /* Collection time setting */
-    pval = flb_input_get_property("interval_sec", in);
-    if (pval != NULL && atoi(pval) > 0) {
-        ctx->interval_sec = atoi(pval);
+    if (ctx->interval_sec <= 0) {
+        ctx->interval_sec = atoi(DEFAULT_INTERVAL_SEC);
     }
-    else {
-        ctx->interval_sec = DEFAULT_INTERVAL_SEC;
-    }
-    ctx->interval_nsec = DEFAULT_INTERVAL_NSEC;
-
-    /* Check if the caller want's to trace a specific Process ID */
-    tmp = flb_input_get_property("pid", in);
-    if (tmp) {
-        ctx->pid = atoi(tmp);
+    if (ctx->interval_nsec <= 0) {
+        ctx->interval_nsec = atoi(DEFAULT_INTERVAL_NSEC);
     }
 
     /* Set the context */
@@ -174,7 +157,8 @@ static int in_mem_init(struct flb_input_instance *in,
                                        ctx->interval_nsec,
                                        config);
     if (ret == -1) {
-        flb_error("Could not set collector for memory input plugin");
+        flb_plg_error(ctx->ins, "could not set collector for memory input plugin");
+        return -1;
     }
 
     return 0;
@@ -195,7 +179,7 @@ static int in_mem_collect(struct flb_input_instance *i_ins,
     if (ctx->pid) {
         task = proc_stat(ctx->pid, ctx->page_size);
         if (!task) {
-            flb_warn("[in_mem] could not measure PID %i", ctx->pid);
+            flb_plg_warn(ctx->ins, "could not measure PID %i", ctx->pid);
             ctx->pid = 0;
         }
     }
@@ -263,10 +247,10 @@ static int in_mem_collect(struct flb_input_instance *i_ins,
         proc_free(task);
     }
 
-    flb_trace("[in_mem] memory total=%lu kb, used=%lu kb, free=%lu kb",
-              info.mem_total, info.mem_used, info.mem_free);
-    flb_trace("[in_mem] swap total=%lu kb, used=%lu kb, free=%lu kb",
-              info.swap_total, info.swap_used, info.swap_free);
+    flb_plg_trace(ctx->ins, "memory total=%lu kb, used=%lu kb, free=%lu kb",
+                  info.mem_total, info.mem_used, info.mem_free);
+    flb_plg_trace(ctx->ins, "swap total=%lu kb, used=%lu kb, free=%lu kb",
+                  info.swap_total, info.swap_used, info.swap_free);
     ++ctx->idx;
 
     flb_input_chunk_append_raw(i_ins, NULL, 0, mp_sbuf.data, mp_sbuf.size);
@@ -280,11 +264,35 @@ static int in_mem_exit(void *data, struct flb_config *config)
     (void) *config;
     struct flb_in_mem_config *ctx = data;
 
+    if (!ctx) {
+        return 0;
+    }
+
     /* done */
     flb_free(ctx);
 
     return 0;
 }
+
+static struct flb_config_map config_map[] = {
+    {
+      FLB_CONFIG_MAP_INT, "interval_sec", DEFAULT_INTERVAL_SEC,
+      0, FLB_TRUE, offsetof(struct flb_in_mem_config, interval_sec),
+      "Set the collector interval"
+    },
+    {
+      FLB_CONFIG_MAP_INT, "interval_nsec", DEFAULT_INTERVAL_NSEC,
+      0, FLB_TRUE, offsetof(struct flb_in_mem_config, interval_nsec),
+      "Set the collector interval (subseconds)"
+    },
+    {
+      FLB_CONFIG_MAP_INT, "pid", "0",
+      0, FLB_TRUE, offsetof(struct flb_in_mem_config, pid),
+      "Set the PID of the process to measure"
+    },
+    /* EOF */
+    {0}
+};
 
 struct flb_input_plugin in_mem_plugin = {
     .name         = "mem",
@@ -293,5 +301,6 @@ struct flb_input_plugin in_mem_plugin = {
     .cb_pre_run   = NULL,
     .cb_collect   = in_mem_collect,
     .cb_flush_buf = NULL,
-    .cb_exit      = in_mem_exit
+    .cb_exit      = in_mem_exit,
+    .config_map   = config_map
 };

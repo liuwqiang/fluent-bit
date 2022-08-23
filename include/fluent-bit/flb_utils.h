@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,6 +23,7 @@
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_pipe.h>
 #include <fluent-bit/flb_config.h>
+#include <fluent-bit/flb_sds.h>
 
 struct flb_split_entry {
     char *value;
@@ -44,10 +44,11 @@ int flb_utils_set_daemon();
 void flb_utils_print_setup(struct flb_config *config);
 
 struct mk_list *flb_utils_split(const char *line, int separator, int max_split);
-
+void flb_utils_split_free_entry(struct flb_split_entry *entry);
 void flb_utils_split_free(struct mk_list *list);
 int flb_utils_timer_consume(flb_pipefd_t fd);
 int64_t flb_utils_size_to_bytes(const char *size);
+int64_t flb_utils_hex2int(char *hex, int len);
 int flb_utils_time_to_seconds(const char *time);
 int flb_utils_pipe_byte_consume(flb_pipefd_t fd);
 int flb_utils_bool(const char *val);
@@ -61,5 +62,12 @@ int flb_utils_write_str_buf(const char *str, size_t str_len,
 
 int flb_utils_url_split(const char *in_url, char **out_protocol,
                         char **out_host, char **out_port, char **out_uri);
+int flb_utils_proxy_url_split(const char *in_url, char **out_protocol,
+                              char **out_username, char **out_password,
+                              char **out_host, char **out_port);
+int flb_utils_read_file(char *path, char **out_buf, size_t *out_size);
+char *flb_utils_get_os_name();
+int flb_utils_uuid_v4_gen(char *buf);
+int flb_utils_get_machine_id(char **out_id, size_t *out_size);
 
 #endif

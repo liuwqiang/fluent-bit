@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -21,6 +20,7 @@
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_config.h>
 #include <fluent-bit/flb_input.h>
+#include <fluent-bit/flb_input_plugin.h>
 #include <fluent-bit/flb_str.h>
 #include <fluent-bit/flb_log.h>
 #include <fluent-bit/flb_parser.h>
@@ -30,10 +30,10 @@
 #include "syslog_server.h"
 #include "syslog_conf.h"
 
-struct flb_syslog *syslog_conf_create(struct flb_input_instance *i_ins,
+struct flb_syslog *syslog_conf_create(struct flb_input_instance *ins,
                                       struct flb_config *config)
 {
-    const char *tmp;
+    int ret;
     char port[16];
     struct flb_syslog *ctx;
 
@@ -43,27 +43,33 @@ struct flb_syslog *syslog_conf_create(struct flb_input_instance *i_ins,
         return NULL;
     }
     ctx->evl = config->evl;
-    ctx->i_ins = i_ins;
+    ctx->ins = ins;
     ctx->buffer_data = NULL;
     mk_list_init(&ctx->connections);
 
+    ret = flb_input_config_map_set(ins, (void *)ctx);
+    if (ret == -1) {
+        flb_plg_error(ins, "unable to load configuration");
+        flb_free(ctx);
+        return NULL;
+    }
+
     /* Syslog mode: unix_udp, unix_tcp, tcp or udp */
-    tmp = flb_input_get_property("mode", i_ins);
-    if (tmp) {
-        if (strcasecmp(tmp, "unix_tcp") == 0) {
+    if (ctx->mode_str) {
+        if (strcasecmp(ctx->mode_str, "unix_tcp") == 0) {
             ctx->mode = FLB_SYSLOG_UNIX_TCP;
         }
-        else if (strcasecmp(tmp, "unix_udp") == 0) {
+        else if (strcasecmp(ctx->mode_str, "unix_udp") == 0) {
             ctx->mode = FLB_SYSLOG_UNIX_UDP;
         }
-        else if (strcasecmp(tmp, "tcp") == 0) {
+        else if (strcasecmp(ctx->mode_str, "tcp") == 0) {
             ctx->mode = FLB_SYSLOG_TCP;
         }
-        else if (strcasecmp(tmp, "udp") == 0) {
+        else if (strcasecmp(ctx->mode_str, "udp") == 0) {
             ctx->mode = FLB_SYSLOG_UDP;
         }
         else {
-            flb_error("[in_syslog] Unknown syslog mode %s", tmp);
+            flb_error("[in_syslog] Unknown syslog mode %s", ctx->mode_str);
             flb_free(ctx);
             return NULL;
         }
@@ -74,67 +80,42 @@ struct flb_syslog *syslog_conf_create(struct flb_input_instance *i_ins,
 
     /* Check if TCP mode was requested */
     if (ctx->mode == FLB_SYSLOG_TCP || ctx->mode == FLB_SYSLOG_UDP) {
-        /* Listen interface */
-        if (!i_ins->host.listen) {
-            tmp = flb_input_get_property("listen", i_ins);
-            if (tmp) {
-                ctx->listen = flb_strdup(tmp);
-            }
-            else {
-                ctx->listen = flb_strdup("0.0.0.0");
-            }
-        }
-        else {
-            ctx->listen = flb_strdup(i_ins->host.listen);
-        }
-
-        /* port */
-        if (i_ins->host.port == 0) {
-            ctx->port = flb_strdup("5140");
-        }
-        else {
-            snprintf(port, sizeof(port) - 1, "%d", i_ins->host.port);
-            ctx->port = flb_strdup(port);
-        }
+        /* Listen interface (if not set, defaults to 0.0.0.0:5140) */
+        flb_input_net_default_listener("0.0.0.0", 5140, ins);
+        ctx->listen = ins->host.listen;
+        snprintf(port, sizeof(port) - 1, "%d", ins->host.port);
+        ctx->port = flb_strdup(port);
     }
 
     /* Unix socket path and permission */
     if (ctx->mode == FLB_SYSLOG_UNIX_UDP || ctx->mode == FLB_SYSLOG_UNIX_TCP) {
-        tmp = flb_input_get_property("path", i_ins);
-        if (tmp) {
-            ctx->unix_path = flb_strdup(tmp);
-        }
-
-        tmp = flb_input_get_property("unix_perm", i_ins);
-        if (tmp) {
-            ctx->unix_perm = strtol(tmp, NULL, 8) & 07777;
+        if (ctx->unix_perm_str) {
+            ctx->unix_perm = strtol(ctx->unix_perm_str, NULL, 8) & 07777;
         } else {
             ctx->unix_perm = 0644;
         }
     }
 
     /* Buffer Chunk Size */
-    tmp = flb_input_get_property("buffer_chunk_size", i_ins);
-    if (!tmp) {
-        ctx->buffer_chunk_size = FLB_SYSLOG_CHUNK; /* 32KB */
-    }
-    else {
-        ctx->buffer_chunk_size = flb_utils_size_to_bytes(tmp);
+    if (ctx->buffer_chunk_size == -1) {
+        flb_plg_error(ins, "invalid buffer_chunk_size");
+        flb_free(ctx);
+        return NULL; 
     }
 
     /* Buffer Max Size */
-    tmp = flb_input_get_property("buffer_max_size", i_ins);
-    if (!tmp) {
-        ctx->buffer_max_size = ctx->buffer_chunk_size;
+    if (ctx->buffer_max_size == -1) {
+        flb_plg_error(ins, "invalid buffer_max_size");
+        flb_free(ctx);
+        return NULL;
     }
-    else {
-        ctx->buffer_max_size  = flb_utils_size_to_bytes(tmp);
+    else if (ctx->buffer_max_size == 0) {
+        ctx->buffer_max_size = ctx->buffer_chunk_size;
     }
 
     /* Parser */
-    tmp = flb_input_get_property("parser", i_ins);
-    if (tmp) {
-        ctx->parser = flb_parser_get(tmp, config);
+    if (ctx->parser_name) {
+        ctx->parser = flb_parser_get(ctx->parser_name, config);
     }
     else {
         if (ctx->mode == FLB_SYSLOG_TCP || ctx->mode == FLB_SYSLOG_UDP) {

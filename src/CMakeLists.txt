@@ -6,21 +6,31 @@ set(src
   flb_mp.c
   flb_kv.c
   flb_api.c
+  flb_csv.c
   flb_lib.c
   flb_log.c
   flb_env.c
+  flb_file.c
   flb_uri.c
-  flb_hash.c
+  flb_hash_table.c
+  flb_help.c
   flb_pack.c
+  flb_pack_gelf.c
   flb_sds.c
   flb_pipe.c
   flb_meta.c
   flb_kernel.c
+  flb_custom.c
   flb_input.c
   flb_input_chunk.c
+  flb_input_metric.c
+  flb_input_thread.c
   flb_filter.c
   flb_output.c
+  flb_output_thread.c
   flb_config.c
+  flb_config_map.c
+  flb_socket.c
   flb_network.c
   flb_utils.c
   flb_slist.c
@@ -36,18 +46,54 @@ set(src
   flb_upstream_node.c
   flb_router.c
   flb_worker.c
+  flb_coro.c
   flb_time.c
   flb_sosreport.c
-  flb_sha512.c
+  flb_hmac.c
+  flb_hash.c
+  flb_crypto.c
+  flb_random.c
   flb_plugin.c
   flb_gzip.c
+  flb_snappy.c
+  flb_http_client.c
+  flb_callback.c
+  flb_strptime.c
+  flb_fstore.c
+  flb_thread_pool.c
+  flb_routes_mask.c
+  flb_typecast.c
+  flb_event.c
+  flb_base64.c
+  flb_ring_buffer.c
   )
 
-if (CMAKE_SYSTEM_NAME MATCHES "Windows")
+# Config format
 set(src
   ${src}
-  flb_dlfcn_win32.c
+  config_format/flb_config_format.c
+  config_format/flb_cf_fluentbit.c
+)
+if(FLB_HAVE_LIBYAML)
+  set(src
+    ${src}
+    config_format/flb_cf_yaml.c
+    )
+endif()
+
+# Multiline subsystem
+add_subdirectory(multiline)
+set(src
+  ${src}
+  ${src_multiline}
   )
+
+if(FLB_SYSTEM_WINDOWS)
+  set(src
+    ${src}
+    flb_dlfcn_win32.c
+    )
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /W2")
 endif()
 
 if(FLB_PARSER)
@@ -62,20 +108,25 @@ if(FLB_PARSER)
     )
 endif()
 
+if(FLB_AVRO_ENCODER)
+  set(src
+    ${src}
+    flb_avro.c
+    )
+endif()
+
 # Fluent Bit have TLS support
 if(FLB_TLS)
   # Register the TLS interface and functions
   set(src
     ${src}
-    "flb_io_tls.c"
+    "tls/flb_tls.c"
     "flb_oauth2.c"
-    "flb_http_client.c"
     )
 
   # Make sure our output targets links to the TLS library
   set(extra_libs
     ${extra_libs}
-    "mbedtls"
     )
 endif()
 
@@ -94,10 +145,39 @@ if(FLB_METRICS)
     )
 endif()
 
+if(FLB_SIGNV4 AND FLB_TLS)
+  set(src
+    ${src}
+    "flb_signv4.c"
+    )
+endif()
+
+if(FLB_HTTP_CLIENT_DEBUG)
+  set(src
+    ${src}
+    "flb_http_client_debug.c"
+     )
+endif()
+
+if (FLB_AWS_ERROR_REPORTER)
+  set(src
+    ${src}
+    "aws/flb_aws_error_reporter.c"
+    )
+endif()
+
 if(FLB_LUAJIT)
   set(src
     ${src}
+    "flb_lua.c"
     "flb_luajit.c"
+    )
+endif()
+
+if(FLB_IN_KAFKA OR FLB_OUT_KAFKA)
+  set(src
+    ${src}
+    "flb_kafka.c"
     )
 endif()
 
@@ -149,22 +229,16 @@ if(FLB_STATIC_CONF)
     )
 endif()
 
-if(NOT FLB_SYSTEM_STRPTIME)
-  set(src
-    ${src}
-    "flb_strptime.c"
-    )
-endif()
-
-
 include(CheckSymbolExists)
 check_symbol_exists(accept4 "sys/socket.h" HAVE_ACCEPT4)
 
 # Core dependencies
-if(CMAKE_SYSTEM_NAME MATCHES "Windows")
+if(FLB_SYSTEM_WINDOWS)
   set(FLB_DEPS
     "ws2_32.lib"
     "crypt32.lib"
+    "Bcrypt.lib"
+    "Shlwapi.lib"
     )
 else()
   set(FLB_DEPS
@@ -184,6 +258,15 @@ endif()
 
 
 # Record Accessor
+# ---------------
+# Make sure it dependency is enabled
+if(FLB_RECORD_ACCESSOR AND NOT FLB_REGEX)
+  message(FATAL_ERROR
+    "FLB_RECORD_ACCESSOR depends on FLB_REGEX, "
+    "enable it with: -DFLB_REGEX=ON")
+endif()
+
+# Build record accessor files
 if(FLB_RECORD_ACCESSOR)
   set(src
     ${src}
@@ -196,6 +279,11 @@ endif()
 # Stream Processor
 if(FLB_STREAM_PROCESSOR)
   add_subdirectory(stream_processor)
+endif()
+
+# AWS specific
+if(FLB_AWS)
+  add_subdirectory(aws)
 endif()
 
 # HTTP Server
@@ -218,20 +306,64 @@ if(FLB_HTTP_SERVER)
     flb-http-server)
 endif()
 
+# AVRO Encoding
+if(FLB_AVRO_ENCODER)
+set(FLB_DEPS
+  ${FLB_DEPS}
+  avro-static
+  jansson
+  )
+endif()
 
 # Set static dependencies
 set(FLB_DEPS
   ${FLB_DEPS}
   mk_core
   jsmn
-  msgpackc-static
+  msgpack-c-static
   mpack-static
   chunkio-static
   miniz
+  xxhash
+  cmetrics-static
   ${FLB_PLUGINS}
   ${FLB_PROXY_PLUGINS}
   ${extra_libs}
+  c-ares
+  snappy-c
+  lwrb
   )
+
+if(OPENSSL_FOUND)
+  set(FLB_DEPS
+    ${FLB_DEPS}
+    OpenSSL::SSL
+    )
+endif()
+
+# libyaml
+if(FLB_HAVE_LIBYAML)
+set(FLB_DEPS
+  ${FLB_DEPS}
+  yaml
+  )
+endif()
+
+# UTF8 Encoding
+if(FLB_UTF8_ENCODER)
+set(FLB_DEPS
+  ${FLB_DEPS}
+  tutf8e
+  )
+endif()
+
+# AWS specific
+if(FLB_AWS)
+  set(FLB_DEPS
+    ${FLB_DEPS}
+    flb-aws
+    )
+endif()
 
 # Record Accessor
 if(FLB_RECORD_ACCESSOR)
@@ -249,6 +381,12 @@ if(FLB_STREAM_PROCESSOR)
     )
 endif()
 
+if (MSVC)
+set(flb_rc_files
+  ${CMAKE_CURRENT_BINARY_DIR}/version.rc
+  )
+endif()
+
 # Shared Library
 if(FLB_SHARED_LIB)
   add_library(fluent-bit-shared SHARED ${src})
@@ -263,9 +401,17 @@ if(FLB_SHARED_LIB)
     target_link_libraries(fluent-bit-shared ${FLB_DEPS} -lpthread)
   endif()
 
+  if (MSVC)
+    set_target_properties(fluent-bit-shared
+      PROPERTIES PDB_NAME fluent-bit.dll)
+    target_link_options(fluent-bit-shared
+      PUBLIC /pdb:$<TARGET_PDB_FILE:fluent-bit-shared>)
+  endif()
+
   # Library install routines
   install(TARGETS fluent-bit-shared
     LIBRARY DESTINATION ${FLB_INSTALL_LIBDIR}
+    COMPONENT library
     RUNTIME DESTINATION ${FLB_INSTALL_BINDIR})
 endif()
 
@@ -288,8 +434,13 @@ endif()
 # Binary / Executable
 if(FLB_BINARY)
   find_package (Threads)
-  add_executable(fluent-bit-bin fluent-bit.c)
+  if (FLB_SYSTEM_WINDOWS)
+    add_executable(fluent-bit-bin fluent-bit.c flb_dump.c win32/winsvc.c ${flb_rc_files})
+  else()
+    add_executable(fluent-bit-bin fluent-bit.c flb_dump.c)
+  endif()
   add_sanitizers(fluent-bit-bin)
+
 
   if(FLB_STATIC_CONF)
     add_dependencies(fluent-bit-bin flb-static-conf)
@@ -304,6 +455,7 @@ if(FLB_BINARY)
   endif()
 
   if(FLB_BACKTRACE)
+    add_definitions(-DFLB_DUMP_STACKTRACE=1)
     target_link_libraries(fluent-bit-bin libbacktrace)
   endif()
 
@@ -313,7 +465,15 @@ if(FLB_BINARY)
     PROPERTIES
     OUTPUT_NAME ${FLB_OUT_NAME}
     ENABLE_EXPORTS ON)
-  install(TARGETS fluent-bit-bin RUNTIME DESTINATION ${FLB_INSTALL_BINDIR})
+  install(TARGETS fluent-bit-bin RUNTIME DESTINATION ${FLB_INSTALL_BINDIR} COMPONENT binary)
+
+  # Include PDB file (if available)
+  if (MSVC)
+    target_link_options(fluent-bit-bin
+      PUBLIC /pdb:$<TARGET_PDB_FILE:fluent-bit-bin>)
+    install(FILES $<TARGET_PDB_FILE:fluent-bit-bin>
+      DESTINATION "${FLB_INSTALL_BINDIR}")
+  endif()
 
   # Detect init system, install upstart, systemd or init.d script
   if(IS_DIRECTORY /lib/systemd/system)
@@ -322,31 +482,48 @@ if(FLB_BINARY)
       "${PROJECT_SOURCE_DIR}/init/systemd.in"
       ${FLB_SYSTEMD_SCRIPT}
       )
-    install(FILES ${FLB_SYSTEMD_SCRIPT} DESTINATION /lib/systemd/system)
-    install(DIRECTORY DESTINATION ${FLB_INSTALL_CONFDIR})
+    install(FILES ${FLB_SYSTEMD_SCRIPT} COMPONENT binary DESTINATION /lib/systemd/system)
+    install(DIRECTORY DESTINATION ${FLB_INSTALL_CONFDIR} COMPONENT binary)
   elseif(IS_DIRECTORY /usr/share/upstart)
     set(FLB_UPSTART_SCRIPT "${PROJECT_SOURCE_DIR}/init/${FLB_OUT_NAME}.conf")
     configure_file(
       "${PROJECT_SOURCE_DIR}/init/upstart.in"
       ${FLB_UPSTART_SCRIPT}
       )
-    install(FILES ${FLB_UPSTART_SCRIPT} DESTINATION /etc/init)
-    install(DIRECTORY DESTINATION ${FLB_INSTALL_CONFDIR})
+    install(FILES ${FLB_UPSTART_SCRIPT} COMPONENT binary DESTINATION /etc/init)
+    install(DIRECTORY DESTINATION COMPONENT binary ${FLB_INSTALL_CONFDIR})
   else()
     # FIXME: should we support Sysv init script ?
   endif()
 
-  install(FILES
-    "${PROJECT_SOURCE_DIR}/conf/fluent-bit.conf"
-    DESTINATION ${FLB_INSTALL_CONFDIR}
-    RENAME "${FLB_OUT_NAME}.conf")
+  if(FLB_SYSTEM_WINDOWS)
+    install(FILES
+      "${PROJECT_SOURCE_DIR}/conf/fluent-bit-win32.conf"
+      DESTINATION ${FLB_INSTALL_CONFDIR}
+      COMPONENT binary
+      RENAME "${FLB_OUT_NAME}.conf")
+  elseif(FLB_SYSTEM_MACOS)
+    install(FILES
+      "${PROJECT_SOURCE_DIR}/conf/fluent-bit-macos.conf"
+      DESTINATION ${FLB_INSTALL_CONFDIR}
+      COMPONENT binary
+      RENAME "${FLB_OUT_NAME}.conf")
+  else()
+    install(FILES
+      "${PROJECT_SOURCE_DIR}/conf/fluent-bit.conf"
+      DESTINATION ${FLB_INSTALL_CONFDIR}
+      COMPONENT binary
+      RENAME "${FLB_OUT_NAME}.conf")
+  endif()
 
   install(FILES
     "${PROJECT_SOURCE_DIR}/conf/parsers.conf"
+    COMPONENT binary
     DESTINATION ${FLB_INSTALL_CONFDIR})
 
   install(FILES
     "${PROJECT_SOURCE_DIR}/conf/plugins.conf"
+    COMPONENT binary
     DESTINATION ${FLB_INSTALL_CONFDIR})
 
 endif()

@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -20,6 +19,7 @@
 
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_input.h>
+#include <fluent-bit/flb_input_plugin.h>
 #include <fluent-bit/flb_engine.h>
 #include <fluent-bit/flb_time.h>
 
@@ -38,8 +38,6 @@
 #include <inttypes.h>
 
 #include "in_kmsg.h"
-
-struct flb_input_plugin in_kmsg_plugin;
 
 /*
  * Note: Functions timeval_diff() and in_kmsg_boot_time() are based
@@ -134,6 +132,11 @@ static inline int process_line(const char *line,
     /* Priority */
     priority = FLB_KLOG_PRI(val);
 
+    if (priority > ctx->prio_level) {
+        /* Drop line */
+        return 0;
+    }
+
     /* Sequence */
     p = strchr(p, ',');
     if (!p) {
@@ -207,14 +210,12 @@ static inline int process_line(const char *line,
     flb_input_chunk_append_raw(i_ins, NULL, 0, mp_sbuf.data, mp_sbuf.size);
     msgpack_sbuffer_destroy(&mp_sbuf);
 
-    flb_trace("[in_kmsg] pri=%i seq=%" PRIu64 " ts=%ld sec=%ld usec=%ld '%s'",
-              priority,
-              sequence,
-              ts,
-              (long int) tv.tv_sec,
-              (long int) tv.tv_usec,
-              p);
-
+    flb_plg_debug(ctx->ins, "pri=%i seq=%" PRIu64 " sec=%ld usec=%ld msg_length=%i",
+                  priority,
+                  sequence,
+                  (long int) tv.tv_sec,
+                  (long int) tv.tv_usec,
+                  line_len - 1);
     return 0;
 
  fail:
@@ -262,8 +263,8 @@ static int in_kmsg_collect(struct flb_input_instance *i_ins,
 }
 
 /* Init kmsg input */
-int in_kmsg_init(struct flb_input_instance *in,
-                 struct flb_config *config, void *data)
+static int in_kmsg_init(struct flb_input_instance *ins,
+                        struct flb_config *config, void *data)
 {
     int fd;
     int ret;
@@ -272,10 +273,10 @@ int in_kmsg_init(struct flb_input_instance *in,
 
     ctx = flb_calloc(1, sizeof(struct flb_in_kmsg_config));
     if (!ctx) {
-        perror("calloc");
+        flb_errno();
         return -1;
     }
-
+    ctx->ins = ins;
     ctx->buf_data = flb_malloc(FLB_KMSG_BUF_SIZE);
     if (!ctx->buf_data) {
         flb_errno();
@@ -285,8 +286,15 @@ int in_kmsg_init(struct flb_input_instance *in,
     ctx->buf_len = 0;
     ctx->buf_size = FLB_KMSG_BUF_SIZE;
 
+    /* Load the config map */
+    ret = flb_input_config_map_set(ins, (void *)ctx);
+    if (ret == -1) {
+        flb_free(ctx);
+        return -1;
+    }
+
     /* set context */
-    flb_input_set_context(in, ctx);
+    flb_input_set_context(ins, ctx);
 
     /* open device */
     fd = open(FLB_KMSG_DEV, O_RDONLY);
@@ -300,18 +308,21 @@ int in_kmsg_init(struct flb_input_instance *in,
     /* get the system boot time */
     ret = boot_time(&ctx->boot_time);
     if (ret == -1) {
-        flb_error("Could not get system boot time for kmsg input plugin");
+        flb_plg_error(ctx->ins,
+                      "could not get system boot time for kmsg input plugin");
         flb_free(ctx);
         return -1;
     }
+    flb_plg_debug(ctx->ins, "prio_level is %d", ctx->prio_level);
 
     /* Set our collector based on a file descriptor event */
-    ret = flb_input_set_collector_event(in,
+    ret = flb_input_set_collector_event(ins,
                                         in_kmsg_collect,
                                         ctx->fd,
                                         config);
     if (ret == -1) {
-        flb_error("Could not set collector for kmsg input plugin");
+        flb_plg_error(ctx->ins,
+                      "could not set collector for kmsg input plugin");
         flb_free(ctx);
         return -1;
     }
@@ -333,6 +344,16 @@ static int in_kmsg_exit(void *data, struct flb_config *config)
     return 0;
 }
 
+static struct flb_config_map config_map[] = {
+    {
+      FLB_CONFIG_MAP_INT, "prio_level", "8",
+      0, FLB_TRUE, offsetof(struct flb_in_kmsg_config, prio_level),
+      "The log level to filter. The kernel log is dropped if its priority is more than prio_level. "
+      "Allowed values are 0-8. Default is 8."
+    },
+    /* EOF */
+    {0}
+};
 
 /* Plugin reference */
 struct flb_input_plugin in_kmsg_plugin = {
@@ -342,5 +363,6 @@ struct flb_input_plugin in_kmsg_plugin = {
     .cb_pre_run   = NULL,
     .cb_collect   = in_kmsg_collect,
     .cb_flush_buf = NULL,
-    .cb_exit      = in_kmsg_exit
+    .cb_exit      = in_kmsg_exit,
+    .config_map   = config_map
 };

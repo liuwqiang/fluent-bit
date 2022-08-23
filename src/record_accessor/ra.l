@@ -1,3 +1,4 @@
+%option prefix="flb_ra_"
 %option caseless
 %{
 #include <stdio.h>
@@ -50,18 +51,19 @@ static inline char *remove_dup_quotes(const char *s, size_t n)
 
 %%
 
+[1-9][0-9]*|0            { yylval->integer = atoi(yytext);  return INTEGER; }
 \'([^']|'{2})*\'           { yylval->string = remove_dup_quotes(yytext + 1, yyleng - 2); return STRING; }
-
-[_A-Za-z][A-Za-z0-9_.]*	   { yylval->string = flb_strdup(yytext); return IDENTIFIER; }
+[_A-Za-z][A-Za-z0-9_.\-/]*	   { yylval->string = flb_strdup(yytext); return IDENTIFIER; }
 
 "$"                     |
 "["                     |
 "]"                     |
+"."                     |
+","                     |
 ";"                     { return yytext[0]; }
-\'                      return QUOTE;
 \n
 [ \t]+			/* ignore whitespace */;
 
-.	flb_error("[sp] bad input character '%s' at line %d", yytext, yylineno);
+.	flb_error("[record accessor] bad input character '%s' at line %d", yytext, yylineno);
 
 %%

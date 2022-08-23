@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,5 +22,6 @@
 
 int flb_unescape_string(const char *buf, int buf_len, char **unesc_buf);
 int flb_unescape_string_utf8(const char *in_buf, int sz, char *out_buf);
+int flb_mysql_unquote_string(char *buf, int buf_len, char **unesc_buf);
 
 #endif

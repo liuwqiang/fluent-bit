@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -19,7 +18,7 @@
  *  limitations under the License.
  */
 
-#include <fluent-bit/flb_info.h>
+#include <fluent-bit/flb_output_plugin.h>
 #include <fluent-bit/flb_mem.h>
 #include <fluent-bit/flb_utils.h>
 
@@ -35,6 +34,7 @@ struct flb_kafka_rest *flb_kr_conf_create(struct flb_output_instance *ins,
     char *endptr;
     struct flb_upstream *upstream;
     struct flb_kafka_rest *ctx;
+    int ret;
 
     /* Allocate context */
     ctx = flb_calloc(1, sizeof(struct flb_kafka_rest));
@@ -42,15 +42,16 @@ struct flb_kafka_rest *flb_kr_conf_create(struct flb_output_instance *ins,
         flb_errno();
         return NULL;
     }
+    ctx->ins = ins;
+
+    ret = flb_output_config_map_set(ins, (void *) ctx);
+    if (ret == -1) {
+        flb_free(ctx);
+        return NULL;
+    }
 
     /* Get network configuration */
-    if (!ins->host.name) {
-        ins->host.name = flb_strdup("127.0.0.1");
-    }
-
-    if (ins->host.port == 0) {
-        ins->host.port = 8082;
-    }
+    flb_output_net_default("127.0.0.1", 8082, ins);
 
     /* use TLS ? */
     if (ins->use_tls == FLB_TRUE) {
@@ -69,13 +70,16 @@ struct flb_kafka_rest *flb_kr_conf_create(struct flb_output_instance *ins,
                                    ins->host.name,
                                    ins->host.port,
                                    io_flags,
-                                   &ins->tls);
+                                   ins->tls);
     if (!upstream) {
-        flb_error("[out_kafka_rest] cannot create Upstream context");
+        flb_plg_error(ctx->ins, "cannot create Upstream context");
         flb_kr_conf_destroy(ctx);
         return NULL;
     }
     ctx->u = upstream;
+    flb_output_upstream_set(ctx->u, ins);
+
+    flb_output_upstream_set(ctx->u, ins);
 
     /* HTTP Auth */
     tmp = flb_output_get_property("http_user", ins);
@@ -129,8 +133,8 @@ struct flb_kafka_rest *flb_kr_conf_create(struct flb_output_instance *ins,
             ctx->tag_key = flb_strdup(tmp);
             ctx->tag_key_len = strlen(tmp);
             if (tmp[0] != '_') {
-                flb_warn("[out_kafka_rest] consider use a tag_key "
-                         "that starts with '_'");
+                flb_plg_warn(ctx->ins, "consider use a tag_key "
+                             "that starts with '_'");
             }
         }
         else {
@@ -146,11 +150,11 @@ struct flb_kafka_rest *flb_kr_conf_create(struct flb_output_instance *ins,
          part = strtol(tmp, &endptr, 10);
          if ((errno == ERANGE && (part == LONG_MAX || part == LONG_MIN))
              || (errno != 0 && part == 0)) {
-             flb_error("[out_kafka_rest] invalid partition number");
+             flb_plg_error(ctx->ins, "invalid partition number");
          }
 
          if (endptr == tmp) {
-             flb_error("[out_kafka_rest] invalid partition number");
+             flb_plg_error(ctx->ins, "invalid partition number");
          }
          ctx->partition = part;
     }
@@ -168,7 +172,14 @@ struct flb_kafka_rest *flb_kr_conf_create(struct flb_output_instance *ins,
     }
 
     /* Set partition based on topic */
-    snprintf(ctx->uri, sizeof(ctx->uri) - 1, "/topics/%s", ctx->topic);
+    tmp = flb_output_get_property("url_path", ins);
+    if (tmp) {
+        ctx->url_path = flb_strdup(tmp);
+        snprintf(ctx->uri, sizeof(ctx->uri) - 1, "%s/topics/%s", ctx->url_path, ctx->topic);
+    } else {
+        ctx->url_path = NULL;
+        snprintf(ctx->uri, sizeof(ctx->uri) - 1, "/topics/%s", ctx->topic);
+    }
 
     /* Kafka: message key */
     tmp = flb_output_get_property("message_key", ins);
@@ -192,6 +203,10 @@ int flb_kr_conf_destroy(struct flb_kafka_rest *ctx)
 
     flb_free(ctx->time_key);
     flb_free(ctx->time_key_format);
+
+    if (ctx->url_path) {
+        flb_free(ctx->url_path);
+    }
 
     if (ctx->include_tag_key) {
         flb_free(ctx->tag_key);

@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,10 +25,11 @@
 
 char *td_http_request(void *data, size_t len,
                       size_t *out_len,
-                      struct flb_out_td_config *ctx, struct flb_config *config);
+                      struct flb_td *ctx, struct flb_config *config);
+
 struct flb_http_client *td_http_client(struct flb_upstream_conn *u_conn,
                                        void *data, size_t len,
                                        char **body,
-                                       struct flb_out_td_config *ctx,
+                                       struct flb_td *ctx,
                                        struct flb_config *config);
 #endif

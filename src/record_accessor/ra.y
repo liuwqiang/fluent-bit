@@ -1,4 +1,6 @@
 %define api.pure full
+%name-prefix "flb_ra_"
+
 %parse-param { struct flb_ra_parser *rp };
 %parse-param { const char *str };
 %lex-param   { void *scanner }
@@ -17,10 +19,10 @@
 #include "ra_parser.h"
 #include "ra_lex.h"
 
-extern int yylex();
+extern int flb_ra_lex();
 
-void yyerror(struct flb_ra_parser *rp, const char *query, void *scanner,
-             const char *str)
+void flb_ra_error(struct flb_ra_parser *rp, const char *query, void *scanner,
+                  const char *str)
 {
     flb_error("[record accessor] %s at '%s'", str, query);
 }
@@ -31,8 +33,7 @@ void yyerror(struct flb_ra_parser *rp, const char *query, void *scanner,
 /* Known Tokens (refer to sql.l) */
 
 /* Keywords */
-%token IDENTIFIER QUOTE QUOTED
-%token STRING
+%token IDENTIFIER STRING INTEGER
 
 %define parse.error verbose
 
@@ -47,6 +48,7 @@ void yyerror(struct flb_ra_parser *rp, const char *query, void *scanner,
 }
 
 %type <string>     IDENTIFIER
+%type <integer>    INTEGER
 %type <string>     STRING
 %type <string>     record_key
 
@@ -82,11 +84,16 @@ record_accessor: record_key
                     }
                     flb_free($2);
                   }
-      record_subkey: '[' STRING ']'
+      record_subkey: record_subkey record_subkey_index | record_subkey_index
+      record_subkey_index:
+                  '[' STRING ']'
                   {
-                    flb_ra_parser_subkey_add(rp, $2);
+                    flb_ra_parser_subentry_add_string(rp, $2);
                     flb_free($2);
                   }
                   |
-                  record_subkey record_subkey
+                  '[' INTEGER ']'
+                  {
+                    flb_ra_parser_subentry_add_array_id(rp, $2);
+                  }
                   ;

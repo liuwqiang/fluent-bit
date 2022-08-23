@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,8 +25,8 @@
 #include <fluent-bit/flb_utils.h>
 
 /* Default collection time: every 1 second (0 nanoseconds) */
-#define DEFAULT_INTERVAL_SEC    1
-#define DEFAULT_INTERVAL_NSEC   0
+#define DEFAULT_INTERVAL_SEC    "1"
+#define DEFAULT_INTERVAL_NSEC   "0"
 #define IN_CPU_KEY_LEN       16
 
 struct cpu_key {
@@ -67,7 +66,7 @@ struct cpu_stats {
 };
 
 /* CPU Input configuration & context */
-struct flb_in_cpu_config {
+struct flb_cpu {
     /* setup */
     pid_t pid;          /* optional PID */
     int n_processors;   /* number of core processors  */
@@ -76,7 +75,7 @@ struct flb_in_cpu_config {
     int interval_sec;   /* interval collection time (Second) */
     int interval_nsec;  /* interval collection time (Nanosecond) */
     struct cpu_stats cstats;
-    struct flb_input_instance *i_ins;
+    struct flb_input_instance *ins;
 };
 
 
@@ -99,7 +98,7 @@ struct flb_in_cpu_config {
  */
 static inline double CPU_METRIC_SYS_AVERAGE(unsigned long pre,
                                             unsigned long now,
-                                            struct flb_in_cpu_config *ctx)
+                                            struct flb_cpu *ctx)
 {
     double diff;
     double total = 0;
@@ -116,7 +115,7 @@ static inline double CPU_METRIC_SYS_AVERAGE(unsigned long pre,
 
 /* Returns the CPU % utilization of a given CPU core */
 static inline double CPU_METRIC_USAGE(unsigned long pre, unsigned long now,
-                                      struct flb_in_cpu_config *ctx)
+                                      struct flb_cpu *ctx)
 {
     double diff;
     double total = 0;
@@ -128,23 +127,6 @@ static inline double CPU_METRIC_USAGE(unsigned long pre, unsigned long now,
     diff = ULL_ABS(now, pre);
 
     total = ((diff * 100) / ctx->cpu_ticks) / (ctx->interval_sec + 1e-9*ctx->interval_nsec);
-    return total;
-}
-
-/* Returns the CPU % utilization of a given CPU core */
-static inline double CPU_METRIC_PID_USAGE(unsigned long pre, unsigned long now,
-                                          struct flb_in_cpu_config *ctx)
-{
-    double diff;
-    double total = 0;
-
-    if (pre == now) {
-        return 0.0;
-    }
-
-    diff = ULL_ABS(now, pre);
-    total = 100.0 * ((diff / ctx->cpu_ticks) / (ctx->interval_sec + 1e-9*ctx->interval_nsec));
-
     return total;
 }
 

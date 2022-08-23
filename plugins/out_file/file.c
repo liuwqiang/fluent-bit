@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -18,11 +17,12 @@
  *  limitations under the License.
  */
 
+#include <fluent-bit/flb_output_plugin.h>
 #include <fluent-bit/flb_mem.h>
-#include <fluent-bit/flb_output.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_time.h>
+#include <fluent-bit/flb_metrics.h>
 #include <msgpack.h>
 
 #include <stdio.h>
@@ -30,23 +30,33 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
+#ifdef FLB_SYSTEM_WINDOWS
+#include <Shlobj.h>
+#include <Shlwapi.h>
+#endif
+
 #include "file.h"
 
 #ifdef FLB_SYSTEM_WINDOWS
 #define NEWLINE "\r\n"
+#define S_ISDIR(m)      (((m) & S_IFMT) == S_IFDIR)
 #else
 #define NEWLINE "\n"
 #endif
 
 struct flb_file_conf {
+    const char *out_path;
     const char *out_file;
     const char *delimiter;
     const char *label_delimiter;
     const char *template;
-    int  format;
+    int format;
+    int csv_column_names;
+    int mkdir;
+    struct flb_output_instance *ins;
 };
 
-static char* check_delimiter(const char *str)
+static char *check_delimiter(const char *str)
 {
     if (str == NULL) {
         return NULL;
@@ -70,81 +80,86 @@ static int cb_file_init(struct flb_output_instance *ins,
                         struct flb_config *config,
                         void *data)
 {
+    int ret;
     const char *tmp;
     char *ret_str;
     (void) config;
     (void) data;
-    struct flb_file_conf *conf;
+    struct flb_file_conf *ctx;
 
-    conf = flb_calloc(1, sizeof(struct flb_file_conf));
-    if (!conf) {
+    ctx = flb_calloc(1, sizeof(struct flb_file_conf));
+    if (!ctx) {
         flb_errno();
         return -1;
     }
+    ctx->ins = ins;
+    ctx->format = FLB_OUT_FILE_FMT_JSON; /* default */
+    ctx->delimiter = NULL;
+    ctx->label_delimiter = NULL;
+    ctx->template = NULL;
 
-    conf->format = FLB_OUT_FILE_FMT_JSON; /* default */
-    conf->delimiter = NULL;
-    conf->label_delimiter = NULL;
-    conf->template = NULL;
-
-    /* Optional output file name/path */
-    tmp = flb_output_get_property("Path", ins);
-    if (tmp) {
-        conf->out_file = tmp;
+    ret = flb_output_config_map_set(ins, (void *) ctx);
+    if (ret == -1) {
+        flb_free(ctx);
+        return -1;
     }
 
     /* Optional, file format */
     tmp = flb_output_get_property("Format", ins);
     if (tmp) {
         if (!strcasecmp(tmp, "csv")) {
-            conf->format    = FLB_OUT_FILE_FMT_CSV;
-            conf->delimiter = ",";
+            ctx->format    = FLB_OUT_FILE_FMT_CSV;
+            ctx->delimiter = ",";
         }
         else if (!strcasecmp(tmp, "ltsv")) {
-            conf->format    = FLB_OUT_FILE_FMT_LTSV;
-            conf->delimiter = "\t";
-            conf->label_delimiter = ":";
+            ctx->format    = FLB_OUT_FILE_FMT_LTSV;
+            ctx->delimiter = "\t";
+            ctx->label_delimiter = ":";
         }
         else if (!strcasecmp(tmp, "plain")) {
-            conf->format    = FLB_OUT_FILE_FMT_PLAIN;
-            conf->delimiter = NULL;
-            conf->label_delimiter = NULL;
+            ctx->format    = FLB_OUT_FILE_FMT_PLAIN;
+            ctx->delimiter = NULL;
+            ctx->label_delimiter = NULL;
         }
         else if (!strcasecmp(tmp, "msgpack")) {
-            conf->format    = FLB_OUT_FILE_FMT_MSGPACK;
-            conf->delimiter = NULL;
-            conf->label_delimiter = NULL;
+            ctx->format    = FLB_OUT_FILE_FMT_MSGPACK;
+            ctx->delimiter = NULL;
+            ctx->label_delimiter = NULL;
         }
         else if (!strcasecmp(tmp, "template")) {
-            conf->format    = FLB_OUT_FILE_FMT_TEMPLATE;
-            conf->template  = "{time} {message}";
+            ctx->format    = FLB_OUT_FILE_FMT_TEMPLATE;
+        }
+        else if (!strcasecmp(tmp, "out_file")) {
+            /* for explicit setting */
+            ctx->format = FLB_OUT_FILE_FMT_JSON;
+        }
+        else {
+            flb_plg_error(ctx->ins, "unknown format %s. abort.", tmp);
+            flb_free(ctx);
+            return -1;
         }
     }
 
     tmp = flb_output_get_property("delimiter", ins);
     ret_str = check_delimiter(tmp);
     if (ret_str != NULL) {
-        conf->delimiter = ret_str;
+        ctx->delimiter = ret_str;
     }
 
     tmp = flb_output_get_property("label_delimiter", ins);
     ret_str = check_delimiter(tmp);
     if (ret_str != NULL) {
-        conf->label_delimiter = ret_str;
-    }
-
-    tmp = flb_output_get_property("template", ins);
-    if (tmp != NULL) {
-        conf->template = tmp;
+        ctx->label_delimiter = ret_str;
     }
 
     /* Set the context */
-    flb_output_set_context(ins, conf);
+    flb_output_set_context(ins, ctx);
 
     return 0;
 }
 
-static int csv_output(FILE *fp, struct flb_time *tm, msgpack_object *obj,
+static int csv_output(FILE *fp, int column_names,
+                      struct flb_time *tm, msgpack_object *obj,
                       struct flb_file_conf *ctx)
 {
     int i;
@@ -154,7 +169,20 @@ static int csv_output(FILE *fp, struct flb_time *tm, msgpack_object *obj,
     if (obj->type == MSGPACK_OBJECT_MAP && obj->via.map.size > 0) {
         kv = obj->via.map.ptr;
         map_size = obj->via.map.size;
-        fprintf(fp, "%f%s", flb_time_to_double(tm), ctx->delimiter);
+
+        if (column_names == FLB_TRUE) {
+            fprintf(fp, "timestamp%s", ctx->delimiter);
+            for (i = 0; i < map_size; i++) {
+                msgpack_object_print(fp, (kv+i)->key);
+                if (i + 1 < map_size) {
+                    fprintf(fp, "%s", ctx->delimiter);
+                }
+            }
+            fprintf(fp, NEWLINE);
+        }
+
+        fprintf(fp, "%lld.%.09ld%s",
+                (long long) tm->tm.tv_sec, tm->tm.tv_nsec, ctx->delimiter);
 
         for (i = 0; i < map_size - 1; i++) {
             msgpack_object_print(fp, (kv+i)->val);
@@ -197,7 +225,8 @@ static int ltsv_output(FILE *fp, struct flb_time *tm, msgpack_object *obj,
     return 0;
 }
 
-static int template_output_write(FILE *fp, struct flb_time *tm, msgpack_object *obj,
+static int template_output_write(struct flb_file_conf *ctx,
+                                 FILE *fp, struct flb_time *tm, msgpack_object *obj,
                                  const char *key, int size)
 {
     int i;
@@ -213,7 +242,7 @@ static int template_output_write(FILE *fp, struct flb_time *tm, msgpack_object *
     }
 
     if (obj->type != MSGPACK_OBJECT_MAP) {
-        flb_error("[out_file] invalid object type (type=%i)", obj->type);
+        flb_plg_error(ctx->ins, "invalid object type (type=%i)", obj->type);
         return -1;
     }
 
@@ -227,7 +256,8 @@ static int template_output_write(FILE *fp, struct flb_time *tm, msgpack_object *
         if (!memcmp(key, kv->key.via.str.ptr, size)) {
             if (kv->val.type == MSGPACK_OBJECT_STR) {
                 fwrite(kv->val.via.str.ptr, 1, kv->val.via.str.size, fp);
-            } else {
+            }
+            else {
                 msgpack_object_print(fp, kv->val);
             }
             return 0;
@@ -270,7 +300,7 @@ static int template_output(FILE *fp, struct flb_time *tm, msgpack_object *obj,
             key = inbrace + 1;
             keysize = pos - inbrace - 1;
 
-            if (template_output_write(fp, tm, obj, key, keysize)) {
+            if (template_output_write(ctx, fp, tm, obj, key, keysize)) {
                 fwrite(inbrace, 1, pos - inbrace + 1, fp);
             }
             inbrace = NULL;
@@ -304,51 +334,162 @@ static int plain_output(FILE *fp, msgpack_object *obj, size_t alloc_size)
     return 0;
 }
 
-static void cb_file_flush(const void *data, size_t bytes,
-                          const char *tag, int tag_len,
-                          struct flb_input_instance *i_ins,
+static void print_metrics_text(struct flb_output_instance *ins,
+                               FILE *fp,
+                               const void *data, size_t bytes)
+{
+    int ret;
+    size_t off = 0;
+    cmt_sds_t text;
+    struct cmt *cmt = NULL;
+
+    /* get cmetrics context */
+    ret = cmt_decode_msgpack_create(&cmt, (char *) data, bytes, &off);
+    if (ret != 0) {
+        flb_plg_error(ins, "could not process metrics payload");
+        return;
+    }
+
+    /* convert to text representation */
+    text = cmt_encode_text_create(cmt);
+
+    /* destroy cmt context */
+    cmt_destroy(cmt);
+
+    fprintf(fp, "%s", text);
+    cmt_encode_text_destroy(text);
+}
+
+static int mkpath(struct flb_output_instance *ins, const char *dir)
+{
+    struct stat st;
+    char *dup_dir = NULL;
+    int ret;
+
+    if (!dir) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (strlen(dir) == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (stat(dir, &st) == 0) {
+        if (S_ISDIR (st.st_mode)) {
+            return 0;
+        }
+        flb_plg_error(ins, "%s is not a directory", dir);
+        errno = ENOTDIR;
+        return -1;
+    }
+
+#ifdef FLB_SYSTEM_WINDOWS
+    char path[MAX_PATH];
+
+    if (_fullpath(path, dir, MAX_PATH) == NULL) {
+        return -1;
+    }
+
+    if (SHCreateDirectoryExA(NULL, path, NULL) != ERROR_SUCCESS) {
+        return -1;
+    }
+    return 0;
+#else
+    dup_dir = strdup(dir);
+    if (!dup_dir) {
+        return -1;
+    }
+    ret = mkpath(ins, dirname(dup_dir));
+    free(dup_dir);
+    if (ret != 0) {
+        return ret;
+    }
+    flb_plg_debug(ins, "creating directory %s", dir);
+    return mkdir(dir, 0755);
+#endif
+}
+
+static void cb_file_flush(struct flb_event_chunk *event_chunk,
+                          struct flb_output_flush *out_flush,
+                          struct flb_input_instance *ins,
                           void *out_context,
                           struct flb_config *config)
 {
     int ret;
+    int column_names;
     FILE * fp;
     msgpack_unpacked result;
     size_t off = 0;
     size_t last_off = 0;
     size_t alloc_size = 0;
     size_t total;
-    const char *out_file;
+    char out_file[PATH_MAX];
     char *buf;
-    char *tag_buf;
+    long file_pos;
     msgpack_object *obj;
     struct flb_file_conf *ctx = out_context;
     struct flb_time tm;
-    (void) i_ins;
     (void) config;
+    char* out_file_copy;
 
-    /* Set the right output */
-    if (!ctx->out_file) {
-        out_file = tag;
+    /* Set the right output file */
+    if (ctx->out_path) {
+        if (ctx->out_file) {
+            snprintf(out_file, PATH_MAX - 1, "%s/%s",
+                     ctx->out_path, ctx->out_file);
+        }
+        else {
+            snprintf(out_file, PATH_MAX - 1, "%s/%s",
+                     ctx->out_path, event_chunk->tag);
+        }
     }
     else {
-        out_file = ctx->out_file;
+        if (ctx->out_file) {
+            snprintf(out_file, PATH_MAX - 1, "%s", ctx->out_file);
+        }
+        else {
+            snprintf(out_file, PATH_MAX - 1, "%s", event_chunk->tag);
+        }
     }
 
     /* Open output file with default name as the Tag */
     fp = fopen(out_file, "ab+");
+    if (ctx->mkdir == FLB_TRUE && fp == NULL && errno == ENOENT) {
+        out_file_copy = strdup(out_file);
+        if (out_file_copy) {
+#ifdef FLB_SYSTEM_WINDOWS
+            PathRemoveFileSpecA(out_file_copy);
+            ret = mkpath(ctx->ins, out_file_copy);
+#else
+            ret = mkpath(ctx->ins, dirname(out_file_copy));
+#endif
+            free(out_file_copy);
+            if (ret == 0) {
+                fp = fopen(out_file, "ab+");
+            }
+        }
+    }
     if (fp == NULL) {
         flb_errno();
+        flb_plg_error(ctx->ins, "error opening: %s", out_file);
         FLB_OUTPUT_RETURN(FLB_ERROR);
     }
 
-    tag_buf = flb_malloc(tag_len + 1);
-    if (!tag_buf) {
-        flb_errno();
+    /*
+     * Get current file stream position, we gather this in case 'csv' format
+     * needs to write the column names.
+     */
+    file_pos = ftell(fp);
+
+    /* Check if the event type is metrics, handle the payload differently */
+    if (event_chunk->type == FLB_INPUT_METRICS) {
+        print_metrics_text(ctx->ins, fp,
+                           event_chunk->data, event_chunk->size);
         fclose(fp);
-        FLB_OUTPUT_RETURN(FLB_RETRY);
+        FLB_OUTPUT_RETURN(FLB_OK);
     }
-    memcpy(tag_buf, tag, tag_len);
-    tag_buf[tag_len] = '\0';
 
     /*
      * Msgpack output format used to create unit tests files, useful for
@@ -359,18 +500,17 @@ static void cb_file_flush(const void *data, size_t bytes,
         total = 0;
 
         do {
-            ret = fwrite((char *)data + off, 1, bytes - off, fp);
+            ret = fwrite((char *) event_chunk->data + off, 1,
+                         event_chunk->size - off, fp);
             if (ret < 0) {
                 flb_errno();
                 fclose(fp);
-                flb_free(tag_buf);
                 FLB_OUTPUT_RETURN(FLB_RETRY);
             }
             total += ret;
-        } while (total < bytes);
+        } while (total < event_chunk->size);
 
         fclose(fp);
-        flb_free(tag_buf);
         FLB_OUTPUT_RETURN(FLB_OK);
     }
 
@@ -379,7 +519,9 @@ static void cb_file_flush(const void *data, size_t bytes,
      * of the map to use as a data point.
      */
     msgpack_unpacked_init(&result);
-    while (msgpack_unpack_next(&result, data, bytes, &off) == MSGPACK_UNPACK_SUCCESS) {
+    while (msgpack_unpack_next(&result,
+                               event_chunk->data,
+                               event_chunk->size, &off) == MSGPACK_UNPACK_SUCCESS) {
         alloc_size = (off - last_off) + 128; /* JSON is larger than msgpack */
         last_off = off;
 
@@ -389,21 +531,27 @@ static void cb_file_flush(const void *data, size_t bytes,
         case FLB_OUT_FILE_FMT_JSON:
             buf = flb_msgpack_to_json_str(alloc_size, obj);
             if (buf) {
-                fprintf(fp, "%s: [%f, %s]" NEWLINE,
-                        tag_buf,
-                        flb_time_to_double(&tm),
+                fprintf(fp, "%s: [%"PRIu64".%09lu, %s]" NEWLINE,
+                        event_chunk->tag,
+                        tm.tm.tv_sec, tm.tm.tv_nsec,
                         buf);
                 flb_free(buf);
             }
             else {
                 msgpack_unpacked_destroy(&result);
                 fclose(fp);
-                flb_free(tag_buf);
                 FLB_OUTPUT_RETURN(FLB_RETRY);
             }
             break;
         case FLB_OUT_FILE_FMT_CSV:
-            csv_output(fp, &tm, obj, ctx);
+            if (ctx->csv_column_names == FLB_TRUE && file_pos == 0) {
+                column_names = FLB_TRUE;
+                file_pos = 1;
+            }
+            else {
+                column_names = FLB_FALSE;
+            }
+            csv_output(fp, column_names, &tm, obj, ctx);
             break;
         case FLB_OUT_FILE_FMT_LTSV:
             ltsv_output(fp, &tm, obj, ctx);
@@ -417,7 +565,6 @@ static void cb_file_flush(const void *data, size_t bytes,
         }
     }
 
-    flb_free(tag_buf);
     msgpack_unpacked_destroy(&result);
     fclose(fp);
 
@@ -428,10 +575,70 @@ static int cb_file_exit(void *data, struct flb_config *config)
 {
     struct flb_file_conf *ctx = data;
 
-    flb_free(ctx);
+    if (!ctx) {
+        return 0;
+    }
 
+    flb_free(ctx);
     return 0;
 }
+
+/* Configuration properties map */
+static struct flb_config_map config_map[] = {
+    {
+     FLB_CONFIG_MAP_STR, "path", NULL,
+     0, FLB_TRUE, offsetof(struct flb_file_conf, out_path),
+     "Absolute path to store the files. This parameter is optional"
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "file", NULL,
+     0, FLB_TRUE, offsetof(struct flb_file_conf, out_file),
+     "Name of the target file to write the records. If 'path' is specified, "
+     "the value is prefixed"
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "format", NULL,
+     0, FLB_FALSE, 0,
+     "Specify the output data format, the available options are: plain (json), "
+     "csv, ltsv and template. If no value is set the outgoing data is formatted "
+     "using the tag and the record in json"
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "delimiter", NULL,
+     0, FLB_FALSE, 0,
+     "Set a custom delimiter for the records"
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "label_delimiter", NULL,
+     0, FLB_FALSE, 0,
+     "Set a custom label delimiter, to be used with 'ltsv' format"
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "template", "{time} {message}",
+     0, FLB_TRUE, offsetof(struct flb_file_conf, template),
+     "Set a custom template format for the data"
+    },
+
+    {
+     FLB_CONFIG_MAP_BOOL, "csv_column_names", "false",
+     0, FLB_TRUE, offsetof(struct flb_file_conf, csv_column_names),
+     "Add column names (keys) in the first line of the target file"
+    },
+
+    {
+     FLB_CONFIG_MAP_BOOL, "mkdir", "false",
+     0, FLB_TRUE, offsetof(struct flb_file_conf, mkdir),
+     "Recursively create output directory if it does not exist. Permissions set to 0755"
+    },
+
+    /* EOF */
+    {0}
+};
 
 struct flb_output_plugin out_file_plugin = {
     .name         = "file",
@@ -440,4 +647,7 @@ struct flb_output_plugin out_file_plugin = {
     .cb_flush     = cb_file_flush,
     .cb_exit      = cb_file_exit,
     .flags        = 0,
+    .workers      = 1,
+    .event_type   = FLB_OUTPUT_LOGS | FLB_OUTPUT_METRICS,
+    .config_map   = config_map,
 };

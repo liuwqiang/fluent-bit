@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -20,7 +19,7 @@
 
 #include <stdio.h>
 
-#include <fluent-bit/flb_output.h>
+#include <fluent-bit/flb_output_plugin.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_time.h>
@@ -84,6 +83,7 @@ static int out_lib_init(struct flb_output_instance *ins,
         flb_errno();
         return -1;
     }
+    ctx->ins = ins;
 
     if (cb_data) {
         /* Set user callback and data */
@@ -91,7 +91,7 @@ static int out_lib_init(struct flb_output_instance *ins,
         ctx->cb_data = cb_data->data;
     }
     else {
-        flb_error("[out_lib] Callback is not set");
+        flb_plg_error(ctx->ins, "Callback is not set");
         flb_free(ctx);
         return -1;
     }
@@ -102,8 +102,8 @@ static int out_lib_init(struct flb_output_instance *ins,
     return 0;
 }
 
-static void out_lib_flush(const void *data, size_t bytes,
-                          const char *tag, int tag_len,
+static void out_lib_flush(struct flb_event_chunk *event_chunk,
+                          struct flb_output_flush *out_flush,
                           struct flb_input_instance *i_ins,
                           void *out_context,
                           struct flb_config *config)
@@ -124,11 +124,11 @@ static void out_lib_flush(const void *data, size_t bytes,
     struct flb_out_lib_config *ctx = out_context;
     (void) i_ins;
     (void) config;
-    (void) tag;
-    (void) tag_len;
 
     msgpack_unpacked_init(&result);
-    while (msgpack_unpack_next(&result, data, bytes, &off) == MSGPACK_UNPACK_SUCCESS) {
+    while (msgpack_unpack_next(&result,
+                               event_chunk->data,
+                               event_chunk->size, &off) == MSGPACK_UNPACK_SUCCESS) {
         if (ctx->max_records > 0 && count >= ctx->max_records) {
             break;
         }
@@ -144,10 +144,24 @@ static void out_lib_flush(const void *data, size_t bytes,
                 FLB_OUTPUT_RETURN(FLB_ERROR);
             }
 
-            memcpy(data_for_user, (char *) data + last_off, alloc_size);
+            memcpy(data_for_user,
+                   (char *) event_chunk->data + last_off, alloc_size);
             data_size = alloc_size;
             break;
         case FLB_OUT_LIB_FMT_JSON:
+#ifdef FLB_HAVE_METRICS
+            if (event_chunk->type == FLB_EVENT_TYPE_METRIC) {
+                alloc_size = (off - last_off) + 4096;
+                buf = flb_msgpack_to_json_str(alloc_size, &result.data);
+                if (buf == NULL) {
+                    msgpack_unpacked_destroy(&result);
+                    FLB_OUTPUT_RETURN(FLB_ERROR);
+                }
+                data_size = strlen(buf);
+                data_for_user = buf;
+            }
+            else {
+#endif
             /* JSON is larger than msgpack */
             alloc_size = (off - last_off) + 128;
 
@@ -173,6 +187,9 @@ static void out_lib_flush(const void *data, size_t bytes,
             flb_free(buf);
             data_for_user = out_buf;
             data_size = len;
+#ifdef FLB_HAVE_METRICS
+            }
+#endif
             break;
         }
 
@@ -200,5 +217,6 @@ struct flb_output_plugin out_lib_plugin = {
     .cb_init      = out_lib_init,
     .cb_flush     = out_lib_flush,
     .cb_exit      = out_lib_exit,
+    .event_type   = FLB_OUTPUT_LOGS | FLB_OUTPUT_METRICS,
     .flags        = 0,
 };

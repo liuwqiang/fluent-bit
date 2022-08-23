@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,6 +25,7 @@
 #include <fluent-bit/flb_mp.h>
 #include <fluent-bit/flb_kv.h>
 #include <fluent-bit/flb_pack.h>
+#include <fluent-bit/flb_metrics.h>
 #include <chunkio/chunkio.h>
 
 static inline int instance_id(struct flb_config *config)
@@ -63,6 +63,9 @@ void flb_filter_do(struct flb_input_chunk *ic,
     int in_records = 0;
     int out_records = 0;
     int diff = 0;
+    int pre_records = 0;
+    uint64_t ts;
+    char *name;
 #endif
     char *ntag;
     const char *work_data;
@@ -74,6 +77,7 @@ void flb_filter_do(struct flb_input_chunk *ic,
     ssize_t write_at;
     struct mk_list *head;
     struct flb_filter_instance *f_ins;
+    struct flb_input_instance *i_ins = ic->in;
 
     /* For the incoming Tag make sure to create a NULL terminated reference */
     ntag = flb_malloc(tag_len + 1);
@@ -85,9 +89,17 @@ void flb_filter_do(struct flb_input_chunk *ic,
     memcpy(ntag, tag, tag_len);
     ntag[tag_len] = '\0';
 
-
     work_data = (const char *) data;
     work_size = bytes;
+
+#ifdef FLB_HAVE_METRICS
+    /* timestamp */
+    ts = cmt_time_now();
+
+    /* Count number of incoming records */
+    in_records = ic->added_records;
+    pre_records = ic->total_records - in_records;
+#endif
 
     /* Iterate filters */
     mk_list_foreach(head, &config->filters) {
@@ -108,20 +120,20 @@ void flb_filter_do(struct flb_input_chunk *ic,
             /* where to position the new content if modified ? */
             write_at = (content_size - work_size);
 
-#ifdef FLB_HAVE_METRICS
-            /* Count number of incoming records */
-            in_records = flb_mp_count(work_data, work_size);
-#endif
-
             /* Invoke the filter callback */
             ret = f_ins->p->cb_filter(work_data,      /* msgpack buffer   */
                                       work_size,      /* msgpack size     */
-                                      tag, tag_len,   /* input tag        */
+                                      ntag, tag_len,  /* input tag        */
                                       &out_buf,       /* new data         */
                                       &out_size,      /* new data size    */
                                       f_ins,          /* filter instance  */
+                                      i_ins,          /* input instance   */
                                       f_ins->context, /* filter priv data */
                                       config);
+
+#ifdef FLB_HAVE_METRICS
+            name = (char *) flb_filter_name(f_ins);
+#endif
 
             /* Override buffer just if it was modified */
             if (ret == FLB_FILTER_MODIFIED) {
@@ -131,11 +143,16 @@ void flb_filter_do(struct flb_input_chunk *ic,
                     flb_input_chunk_write_at(ic, write_at, "", 0);
 
 #ifdef FLB_HAVE_METRICS
-                    /* Summarize all records removed */
+                    ic->total_records = pre_records;
+
+                    /* cmetrics */
+                    cmt_counter_add(f_ins->cmt_drop_records, ts, in_records,
+                                    1, (char *[]) {name});
+
+                    /* [OLD] Summarize all records removed */
                     flb_metrics_sum(FLB_METRIC_N_DROPPED,
                                     in_records, f_ins->metrics);
 #endif
-
                     break;
                 }
                 else {
@@ -143,16 +160,30 @@ void flb_filter_do(struct flb_input_chunk *ic,
                     out_records = flb_mp_count(out_buf, out_size);
                     if (out_records > in_records) {
                         diff = (out_records - in_records);
-                        /* Summarize new records */
+
+                        /* cmetrics */
+                        cmt_counter_add(f_ins->cmt_add_records, ts, diff,
+                                    1, (char *[]) {name});
+
+                        /* [OLD] Summarize new records */
                         flb_metrics_sum(FLB_METRIC_N_ADDED,
                                         diff, f_ins->metrics);
                     }
                     else if (out_records < in_records) {
                         diff = (in_records - out_records);
-                        /* Summarize dropped records */
+
+                        /* cmetrics */
+                        cmt_counter_add(f_ins->cmt_drop_records, ts, diff,
+                                    1, (char *[]) {name});
+
+                        /* [OLD] Summarize dropped records */
                         flb_metrics_sum(FLB_METRIC_N_DROPPED,
                                         diff, f_ins->metrics);
                     }
+
+                    /* set number of records in new chunk */
+                    in_records = out_records;
+                    ic->total_records = pre_records + in_records;
 #endif
                 }
                 ret = flb_input_chunk_write_at(ic, write_at,
@@ -167,9 +198,13 @@ void flb_filter_do(struct flb_input_chunk *ic,
                 /* Point back the 'data' pointer to the new address */
                 ret = cio_chunk_get_content(ic->chunk,
                                             (char **) &work_data, &cur_size);
-
-                work_data += (cur_size - out_size);
-                work_size = out_size;
+                if (ret != CIO_OK) {
+                    flb_error("[filter] error retrieving data chunk");
+                }
+                else {
+                    work_data += (cur_size - out_size);
+                    work_size = out_size;
+                }
                 flb_free(out_buf);
             }
         }
@@ -178,15 +213,16 @@ void flb_filter_do(struct flb_input_chunk *ic,
     flb_free(ntag);
 }
 
-int flb_filter_set_property(struct flb_filter_instance *filter,
+int flb_filter_set_property(struct flb_filter_instance *ins,
                             const char *k, const char *v)
 {
     int len;
+    int ret;
     flb_sds_t tmp;
     struct flb_kv *kv;
 
     len = strlen(k);
-    tmp = flb_env_var_translate(filter->config->env, v);
+    tmp = flb_env_var_translate(ins->config->env, v);
     if (!tmp) {
         return -1;
     }
@@ -194,24 +230,32 @@ int flb_filter_set_property(struct flb_filter_instance *filter,
     /* Check if the key is a known/shared property */
 #ifdef FLB_HAVE_REGEX
     if (prop_key_check("match_regex", k, len) == 0) {
-        filter->match_regex = flb_regex_create(tmp);
+        ins->match_regex = flb_regex_create(tmp);
         flb_sds_destroy(tmp);
     }
     else
 #endif
     if (prop_key_check("match", k, len) == 0) {
-        filter->match = tmp;
+        ins->match = tmp;
     }
     else if (prop_key_check("alias", k, len) == 0 && tmp) {
-        filter->alias = tmp;
+        ins->alias = tmp;
+    }
+    else if (prop_key_check("log_level", k, len) == 0 && tmp) {
+        ret = flb_log_get_level_str(tmp);
+        flb_sds_destroy(tmp);
+        if (ret == -1) {
+            return -1;
+        }
+        ins->log_level = ret;
     }
     else {
         /*
          * Create the property, we don't pass the value since we will
          * map it directly to avoid an extra memory allocation.
          */
-        kv = flb_kv_item_create(&filter->properties, (char *) k, NULL);
-        if (!k) {
+        kv = flb_kv_item_create(&ins->properties, (char *) k, NULL);
+        if (!kv) {
             if (tmp) {
                 flb_sds_destroy(tmp);
             }
@@ -224,9 +268,20 @@ int flb_filter_set_property(struct flb_filter_instance *filter,
 }
 
 const char *flb_filter_get_property(const char *key,
-                                    struct flb_filter_instance *i)
+                                    struct flb_filter_instance *ins)
 {
-    return flb_kv_get_key_value(key, &i->properties);
+    return flb_kv_get_key_value(key, &ins->properties);
+}
+
+void flb_filter_instance_exit(struct flb_filter_instance *ins,
+                              struct flb_config *config)
+{
+    struct flb_filter_plugin *p;
+
+    p = ins->p;
+    if (p->cb_exit && ins->context) {
+        p->cb_exit(ins->context, config);
+    }
 }
 
 /* Invoke exit call for the filter plugin */
@@ -240,37 +295,11 @@ void flb_filter_exit(struct flb_config *config)
     mk_list_foreach_safe(head, tmp, &config->filters) {
         ins = mk_list_entry(head, struct flb_filter_instance, _head);
         p = ins->p;
-
-        /* Check a exit callback */
-        if (p->cb_exit && ins->context) {
-            p->cb_exit(ins->context, config);
+        if (!p) {
+            continue;
         }
-
-        /* release properties */
-        flb_kv_release(&ins->properties);
-
-        if (ins->match != NULL) {
-            flb_sds_destroy(ins->match);
-        }
-
-#ifdef FLB_HAVE_REGEX
-        if (ins->match_regex) {
-            flb_regex_destroy(ins->match_regex);
-        }
-#endif
-
-        /* Remove metrics */
-#ifdef FLB_HAVE_METRICS
-        if (ins->metrics) {
-            flb_metrics_destroy(ins->metrics);
-        }
-#endif
-        if (ins->alias) {
-            flb_sds_destroy(ins->alias);
-        }
-
-        mk_list_del(&ins->_head);
-        flb_free(ins);
+        flb_filter_instance_exit(ins, config);
+        flb_filter_instance_destroy(ins);
     }
 }
 
@@ -288,7 +317,7 @@ struct flb_filter_instance *flb_filter_new(struct flb_config *config,
 
     mk_list_foreach(head, &config->filter_plugins) {
         plugin = mk_list_entry(head, struct flb_filter_plugin, _head);
-        if (strcmp(plugin->name, filter) == 0) {
+        if (strcasecmp(plugin->name, filter) == 0) {
             break;
         }
         plugin = NULL;
@@ -320,6 +349,8 @@ struct flb_filter_instance *flb_filter_new(struct flb_config *config,
 #ifdef FLB_HAVE_REGEX
     instance->match_regex = NULL;
 #endif
+    instance->log_level = -1;
+
     mk_list_init(&instance->properties);
     mk_list_add(&instance->_head, &config->filters);
 
@@ -327,93 +358,177 @@ struct flb_filter_instance *flb_filter_new(struct flb_config *config,
 }
 
 /* Return an instance name or alias */
-const char *flb_filter_name(struct flb_filter_instance *in)
+const char *flb_filter_name(struct flb_filter_instance *ins)
 {
-    if (in->alias) {
-        return in->alias;
+    if (ins->alias) {
+        return ins->alias;
     }
 
-    return in->name;
+    return ins->name;
 }
 
 /* Initialize all filter plugins */
-void flb_filter_initialize_all(struct flb_config *config)
+int flb_filter_init_all(struct flb_config *config)
 {
     int ret;
-#ifdef FLB_HAVE_METRICS
-    const char *name;
-#endif
+    uint64_t ts;
+    char *name;
     struct mk_list *tmp;
     struct mk_list *head;
+    struct mk_list *config_map;
     struct flb_filter_plugin *p;
-    struct flb_filter_instance *in;
+    struct flb_filter_instance *ins;
 
     /* Iterate all active filter instance plugins */
     mk_list_foreach_safe(head, tmp, &config->filters) {
-        in = mk_list_entry(head, struct flb_filter_instance, _head);
+        ins = mk_list_entry(head, struct flb_filter_instance, _head);
 
-        if (!in->match
+        if (!ins->match
 #ifdef FLB_HAVE_REGEX
-            && !in->match_regex
+            && !ins->match_regex
 #endif
             ) {
             flb_warn("[filter] NO match rule for %s filter instance, unloading.",
-                     in->name);
-            mk_list_del(&in->_head);
-            flb_free(in);
+                     ins->name);
+            flb_filter_instance_destroy(ins);
             continue;
         }
+        if (ins->log_level == -1) {
+            ins->log_level = config->log->level;
+        }
 
+        p = ins->p;
 
-        p = in->p;
-
-        /* Metrics */
-#ifdef FLB_HAVE_METRICS
         /* Get name or alias for the instance */
-        name = flb_filter_name(in);
+        name = (char *) flb_filter_name(ins);
+        ts = cmt_time_now();
+
+        /* CMetrics */
+        ins->cmt = cmt_create();
+        if (!ins->cmt) {
+            flb_error("[filter] could not create cmetrics context: %s",
+                      flb_filter_name(ins));
+            return -1;
+        }
+
+        /* Register generic filter plugin metrics */
+        ins->cmt_add_records = cmt_counter_create(ins->cmt,
+                                                  "fluentbit", "filter",
+                                                  "add_records_total",
+                                                  "Total number of new added records.",
+                                                  1, (char *[]) {"name"});
+        cmt_counter_set(ins->cmt_add_records, ts, 0, 1, (char *[]) {name});
+
+        /* Register generic filter plugin metrics */
+        ins->cmt_drop_records = cmt_counter_create(ins->cmt,
+                                                  "fluentbit", "filter",
+                                                  "drop_records_total",
+                                                  "Total number of dropped records.",
+                                                  1, (char *[]) {"name"});
+        cmt_counter_set(ins->cmt_drop_records, ts, 0, 1, (char *[]) {name});
+
+        /* OLD Metrics API */
+#ifdef FLB_HAVE_METRICS
 
         /* Create the metrics context */
-        in->metrics = flb_metrics_create(name);
-        if (!in->metrics) {
+        ins->metrics = flb_metrics_create(name);
+        if (!ins->metrics) {
             flb_warn("[filter] cannot initialize metrics for %s filter, "
                      "unloading.", name);
-            mk_list_del(&in->_head);
-            flb_free(in);
+            mk_list_del(&ins->_head);
+            flb_free(ins);
             continue;
         }
 
         /* Register filter metrics */
-        flb_metrics_add(FLB_METRIC_N_DROPPED, "drop_records", in->metrics);
-        flb_metrics_add(FLB_METRIC_N_ADDED, "add_records", in->metrics);
+        flb_metrics_add(FLB_METRIC_N_DROPPED, "drop_records", ins->metrics);
+        flb_metrics_add(FLB_METRIC_N_ADDED, "add_records", ins->metrics);
 #endif
+
+        /*
+         * Before to call the initialization callback, make sure that the received
+         * configuration parameters are valid if the plugin is registering a config map.
+         */
+        if (p->config_map) {
+            /*
+             * Create a dynamic version of the configmap that will be used by the specific
+             * instance in question.
+             */
+            config_map = flb_config_map_create(config, p->config_map);
+            if (!config_map) {
+                flb_error("[filter] error loading config map for '%s' plugin",
+                          p->name);
+                return -1;
+            }
+            ins->config_map = config_map;
+
+            /* Validate incoming properties against config map */
+            ret = flb_config_map_properties_check(ins->p->name,
+                                                  &ins->properties, ins->config_map);
+            if (ret == -1) {
+                if (config->program_name) {
+                    flb_helper("try the command: %s -F %s -h\n",
+                               config->program_name, ins->p->name);
+                }
+                flb_filter_instance_destroy(ins);
+                return -1;
+            }
+        }
 
         /* Initialize the input */
         if (p->cb_init) {
-            ret = p->cb_init(in, config, in->data);
+            ret = p->cb_init(ins, config, ins->data);
             if (ret != 0) {
-                flb_error("Failed initialize filter %s", in->name);
-
-                /* release properties */
-                flb_kv_release(&in->properties);
-
-                if (in->match != NULL) {
-                    flb_sds_destroy(in->match);
-                }
-
-#ifdef FLB_HAVE_REGEX
-                if (in->match_regex) {
-                    flb_regex_destroy(in->match_regex);
-                }
-#endif
-
-#ifdef FLB_HAVE_METRICS
-                flb_metrics_destroy(in->metrics);
-#endif
-                mk_list_del(&in->_head);
-                flb_free(in);
+                flb_error("Failed initialize filter %s", ins->name);
+                flb_filter_instance_destroy(ins);
+                return -1;
             }
         }
     }
+
+    return 0;
+}
+
+void flb_filter_instance_destroy(struct flb_filter_instance *ins)
+{
+    if (!ins) {
+        return;
+    }
+
+    /* destroy config map */
+    if (ins->config_map) {
+        flb_config_map_destroy(ins->config_map);
+    }
+
+    /* release properties */
+    flb_kv_release(&ins->properties);
+
+    if (ins->match != NULL) {
+        flb_sds_destroy(ins->match);
+    }
+
+#ifdef FLB_HAVE_REGEX
+    if (ins->match_regex) {
+        flb_regex_destroy(ins->match_regex);
+    }
+#endif
+
+    /* Remove metrics */
+#ifdef FLB_HAVE_METRICS
+    if (ins->cmt) {
+        cmt_destroy(ins->cmt);
+    }
+
+    if (ins->metrics) {
+        flb_metrics_destroy(ins->metrics);
+    }
+#endif
+    if (ins->alias) {
+        flb_sds_destroy(ins->alias);
+    }
+
+    mk_list_del(&ins->_head);
+    flb_free(ins);
 }
 
 void flb_filter_set_context(struct flb_filter_instance *ins, void *context)

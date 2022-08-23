@@ -2,6 +2,10 @@
 
 We build Open Source software and we invite everyone to join us and contribute. So if you are interested into participate, please refer to the guidelines below.
 
+## Developer Guide
+
+[Developer Guide with code examples](DEVELOPER_GUIDE.md).
+
 ## GIT Repositories
 
 All code changes and submissions happens on [Github](http://github.com), that means that to start contributing you should clone the target repository, perform local changes and then do a Pull Request. For more details about the workflow we suggest you check the following documents:
@@ -18,6 +22,10 @@ Our development coding style for C is based on the Apache C style guidelines, we
 You have to pay attention to the code indentation, tabs are 4 spaces, spaces on conditionals, etc. If your code submission is not aligned, it will be rejected.
 
 ### General requirements
+
+#### Line Length
+
+Fluent Bit source code lines length should not exceed 90 characters.
 
 #### Braces usage on conditionals, loops and functions:
 
@@ -75,7 +83,7 @@ the proper way is to perform the variable definitions on top:
 int flb_something(int a, int b)
 {
     int ret;
-    
+
     if (a > 10) {
         return 1;
     }
@@ -89,6 +97,31 @@ int flb_something(int a, int b)
 ### Functions and nested levels
 
 If your function is too long where many nested levels exists, consider to split your function in different ones and declare the spitted parts as static functions if they don't be intended to be called out of the scope of the source code file in question.
+
+### Comments in the code
+
+Commenting code is always encouraged, that makes things easier to the reader to understand what the code is doing or aims to do.
+
+In Fluent Bit, every code comment starts with a slash asterisk ```/*```  and ends with a asterisk slash ```*/```. If the text in the comment is longer than 80 characters, append a new commented line. We use the following format depending on the case:
+
+#### Single line comment
+
+```C
+/* This is my comment */
+```
+
+#### Multiline comment
+
+```c
+/*
+ * This is my comment which is longer than 80 characters, so we must use the
+ * multi-line type comments.
+ */
+```
+
+
+
+
 
 ## Commit Changes
 
@@ -121,24 +154,24 @@ When you commit your local changes in your repository (before to push to Github)
 
    Common components prefix are:
 
-   - utils: 
+   - utils:
    - pack:
    - sds:
    - http_client:
 
-   As you can see prefixes are basically the file name of the source code file under [src](https://github.com/fluent/fluent-bit/tree/master/src) directory without the file prefix <u>flb_</u>. 
+   As you can see prefixes are basically the file name of the source code file under [src](https://github.com/fluent/fluent-bit/tree/master/src) directory without the file prefix <u>flb_</u>.
 
    When committing changes to code that's related to some plugins, the commit subject must be prefixed with the name of the plugin being changed, e.g:
 
    - in_stdin:
-   - out_http: 
+   - out_http:
    - out_kafka:
 
    please refer to the [plugins](https://github.com/fluent/fluent-bit/tree/master/plugins) directory as a reference
 
 - One single commit **must not** include changes to files that are different from the component specified in the subject, e.g: If you are extending flb_utils.c file, the git patch should not touch any other file than flb_utils.c or flb_utils.h.
 
-- One single commit **must not** include multiple prefixes to specify different areas being touched. 
+- One single commit **must not** include multiple prefixes to specify different areas being touched.
 
  - The subject of the commit **must not** be longer than 80 characters.
 
@@ -155,8 +188,7 @@ When you commit your local changes in your repository (before to push to Github)
 ```
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -181,3 +213,16 @@ When we review your code submission, they must follow our coding style, the code
 If your code needs some improvement, someone of the reviewers or core developers will write a comment in your Pull Request, so please take in count the suggestion there, otherwise your request will never be merged.
 
 Despite the effort that took for you to create the contribution, that is not an indication that the code have to be merged into upstream, everything will be reviewed and must be aligned as the code base.
+
+## Release branches
+
+Fluent Bit follows this general branching strategy:
+
+* `master` is the next major version (not yet released)
+* `<major>` is the branch for an existing stable release
+
+Generally a PR will target the default `master` branch so the changes will go into the next major release.
+
+Once merged, this does not mean they will automatically go into the next minor release of the current series.
+
+A particular set of changes might want to be applied to the current or previous releases so please also submit a PR targeting the branch for the particular release series you want or think it should be applied to, e.g. if a change should go into a 1.8.X release then target the `1.8` branch.

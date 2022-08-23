@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,7 +24,7 @@
 #include <fcntl.h>
 
 #include <msgpack.h>
-#include <fluent-bit/flb_input.h>
+#include <fluent-bit/flb_input_plugin.h>
 #include <fluent-bit/flb_config.h>
 #include <fluent-bit/flb_error.h>
 #include <fluent-bit/flb_utils.h>
@@ -48,11 +47,11 @@ static int in_syslog_collect_tcp(struct flb_input_instance *i_ins,
     /* Accept the new connection */
     fd = flb_net_accept(ctx->server_fd);
     if (fd == -1) {
-        flb_error("[in_syslog] could not accept new connection");
+        flb_plg_error(ctx->ins, "could not accept new connection");
         return -1;
     }
 
-    flb_trace("[in_syslog] new Unix connection arrived FD=%i", fd);
+    flb_plg_debug(ctx->ins, "new Unix connection arrived FD=%i", fd);
     conn = syslog_conn_add(fd, ctx);
     if (!conn) {
         return -1;
@@ -99,13 +98,13 @@ static int in_syslog_init(struct flb_input_instance *in,
     /* Allocate space for the configuration */
     ctx = syslog_conf_create(in, config);
     if (!ctx) {
-        flb_error("[in_syslog] could not initialize plugin");
+        flb_plg_error(in, "could not initialize plugin");
         return -1;
     }
 
     if ((ctx->mode == FLB_SYSLOG_UNIX_TCP || ctx->mode == FLB_SYSLOG_UNIX_UDP)
         && !ctx->unix_path) {
-        flb_error("[in_syslog] Unix path not defined");
+        flb_plg_error(ctx->ins, "Unix path not defined");
         syslog_conf_destroy(ctx);
         return -1;
     }
@@ -136,7 +135,7 @@ static int in_syslog_init(struct flb_input_instance *in,
     }
 
     if (ret == -1) {
-        flb_error("[in_syslog] Could not set collector");
+        flb_plg_error(ctx->ins, "Could not set collector");
         syslog_conf_destroy(ctx);
     }
 
@@ -154,6 +153,40 @@ static int in_syslog_exit(void *data, struct flb_config *config)
     return 0;
 }
 
+static struct flb_config_map config_map[] = {
+    {
+     FLB_CONFIG_MAP_STR, "mode", (char *)NULL,
+     0, FLB_TRUE, offsetof(struct flb_syslog, mode_str),
+     "Set the socket mode: unix_tcp, unix_udp, tcp or udp"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "path", (char *)NULL,
+     0, FLB_TRUE, offsetof(struct flb_syslog, unix_path),
+     "Set the path for the UNIX socket"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "unix_perm", (char *)NULL,
+     0, FLB_TRUE, offsetof(struct flb_syslog, unix_perm_str),
+     "Set the permissions for the UNIX socket"
+    },
+    {
+      FLB_CONFIG_MAP_SIZE, "buffer_chunk_size", FLB_SYSLOG_CHUNK,
+      0, FLB_TRUE, offsetof(struct flb_syslog, buffer_chunk_size),
+      "Set the buffer chunk size"
+    },
+    {
+      FLB_CONFIG_MAP_SIZE, "buffer_max_size", (char *)NULL,
+      0, FLB_TRUE, offsetof(struct flb_syslog, buffer_max_size),
+      "Set the buffer chunk size"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "parser", (char *)NULL,
+     0, FLB_TRUE, offsetof(struct flb_syslog, parser_name),
+     "Set the parser"
+    },
+    /* EOF */
+    {0}
+};
 
 struct flb_input_plugin in_syslog_plugin = {
     .name         = "syslog",
@@ -163,5 +196,6 @@ struct flb_input_plugin in_syslog_plugin = {
     .cb_collect   = NULL,
     .cb_flush_buf = NULL,
     .cb_exit      = in_syslog_exit,
+    .config_map   = config_map,
     .flags        = FLB_INPUT_NET
 };

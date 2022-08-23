@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -44,10 +43,13 @@ struct flb_parser {
     int type;             /* parser type */
     char *name;           /* format name */
     char *p_regex;        /* pattern for main regular expression */
+    int skip_empty;       /* skip empty regex matches */
     char *time_fmt;       /* time format */
+    char *time_fmt_full;  /* original given time format */
     char *time_key;       /* field name that contains the time */
     int time_offset;      /* fixed UTC offset */
     int time_keep;        /* keep time field */
+    int time_strict;      /* parse time field strictly */
     char *time_frac_secs; /* time format have fractional seconds ? */
     struct flb_parser_types *types; /* type casting */
     int types_len;
@@ -88,9 +90,11 @@ static inline time_t flb_parser_tm2time(const struct tm *src)
 
 struct flb_parser *flb_parser_create(const char *name, const char *format,
                                      const char *p_regex,
+                                     int skip_empty,
                                      const char *time_fmt, const char *time_key,
                                      const char *time_offset,
                                      int time_keep,
+                                     int time_strict,
                                      struct flb_parser_types *types,
                                      int types_len,
                                      struct mk_list *decoders,
@@ -103,7 +107,6 @@ int flb_parser_do(struct flb_parser *parser, const char *buf, size_t length,
 
 void flb_parser_exit(struct flb_config *config);
 int flb_parser_tzone_offset(const char *str, int len, int *tmdiff);
-int flb_parser_frac(const char *str, int len, double *frac, const char **end);
 int flb_parser_time_lookup(const char *time, size_t tsize, time_t now,
                            struct flb_parser *parser,
                            struct tm *tm, double *ns);

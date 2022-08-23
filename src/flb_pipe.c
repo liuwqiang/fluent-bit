@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -97,6 +96,14 @@ void flb_pipe_destroy(flb_pipefd_t pipefd[2])
 
 int flb_pipe_close(flb_pipefd_t fd)
 {
+    /* 
+     *  when chunk file is destroyed, the fd for file will be -1, we should avoid
+     *  deleting chunk file with fd -1
+     */
+    if (fd == -1) {
+        return -1;
+    }
+
     return close(fd);
 }
 
@@ -129,6 +136,7 @@ ssize_t flb_pipe_read_all(int fd, void *buf, size_t count)
                 flb_time_msleep(50);
                 continue;
             }
+            return -1;
         }
         else if (bytes == 0) {
             /* Broken pipe ? */
@@ -160,6 +168,7 @@ ssize_t flb_pipe_write_all(int fd, const void *buf, size_t count)
                 flb_time_msleep(50);
                 continue;
             }
+            return -1;
         }
         else if (bytes == 0) {
             /* Broken pipe ? */

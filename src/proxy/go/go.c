@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -22,6 +21,7 @@
 #include <fluent-bit/flb_config.h>
 #include <fluent-bit/flb_plugin_proxy.h>
 #include <fluent-bit/flb_output.h>
+#include "./go.h"
 
 /*
  * These functions needs to be moved to a better place, still in
@@ -33,7 +33,7 @@
 /*
  * Go Plugin phases
  * ================
- *  Copyright (C) 2019      The Fluent Bit Authors
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  1. FLBPluginRegister(context)
  *  2. Inside FLBPluginRegister, it needs to register it self using Fluent Bit API
@@ -51,22 +51,10 @@
  *
  * 3. Plugin Initialization
  */
-
-struct flbgo_output_plugin {
-    char *name;
-    void *api;
-    void *o_ins;
-    struct flb_plugin_proxy_context *context;
-
-    int (*cb_init)();
-    int (*cb_flush)(const void *, size_t, const char *);
-    int (*cb_flush_ctx)(void *, const void *, size_t, char *);
-    int (*cb_exit)(void *);
-};
 /*------------------------EOF------------------------------------------------*/
 
-int proxy_go_register(struct flb_plugin_proxy *proxy,
-                      struct flb_plugin_proxy_def *def)
+int proxy_go_output_register(struct flb_plugin_proxy *proxy,
+                             struct flb_plugin_proxy_def *def)
 {
     struct flbgo_output_plugin *plugin;
 
@@ -89,7 +77,7 @@ int proxy_go_register(struct flb_plugin_proxy *proxy,
 
     plugin->cb_init  = flb_plugin_proxy_symbol(proxy, "FLBPluginInit");
     if (!plugin->cb_init) {
-        fprintf(stderr, "[go proxy]: could not load FLBPluginInit symbol\n");
+        flb_error("[go proxy]: could not load FLBPluginInit symbol");
         flb_free(plugin);
         return -1;
     }
@@ -97,6 +85,7 @@ int proxy_go_register(struct flb_plugin_proxy *proxy,
     plugin->cb_flush = flb_plugin_proxy_symbol(proxy, "FLBPluginFlush");
     plugin->cb_flush_ctx = flb_plugin_proxy_symbol(proxy, "FLBPluginFlushCtx");
     plugin->cb_exit  = flb_plugin_proxy_symbol(proxy, "FLBPluginExit");
+    plugin->cb_exit_ctx = flb_plugin_proxy_symbol(proxy, "FLBPluginExitCtx");
     plugin->name     = flb_strdup(def->name);
 
     /* This Go plugin context is an opaque data for the parent proxy */
@@ -105,7 +94,7 @@ int proxy_go_register(struct flb_plugin_proxy *proxy,
     return 0;
 }
 
-int proxy_go_init(struct flb_plugin_proxy *proxy)
+int proxy_go_output_init(struct flb_plugin_proxy *proxy)
 {
     int ret;
     struct flbgo_output_plugin *plugin = proxy->data;
@@ -128,15 +117,15 @@ int proxy_go_init(struct flb_plugin_proxy *proxy)
     return ret;
 }
 
-int proxy_go_flush(struct flb_plugin_proxy_context *ctx,
-                   const void *data, size_t size,
-                   const char *tag, int tag_len)
+int proxy_go_output_flush(struct flb_plugin_proxy_context *ctx,
+                          const void *data, size_t size,
+                          const char *tag, int tag_len)
 {
     int ret;
     char *buf;
     struct flbgo_output_plugin *plugin = ctx->proxy->data;
 
-    /* temporal buffer for the tag */
+    /* temporary buffer for the tag */
     buf = flb_malloc(tag_len + 1);
     if (!buf) {
         flb_errno();
@@ -153,5 +142,128 @@ int proxy_go_flush(struct flb_plugin_proxy_context *ctx,
         ret = plugin->cb_flush(data, size, buf);
     }
     flb_free(buf);
+    return ret;
+}
+
+int proxy_go_output_destroy(void *data)
+{
+    int ret = 0;
+    struct flbgo_output_plugin *plugin;
+
+    plugin = (struct flbgo_output_plugin *) data;
+    flb_debug("[GO] running exit callback");
+
+    if (plugin->cb_exit_ctx) {
+        ret = plugin->cb_exit_ctx(plugin->context->remote_context);
+    }
+    else if (plugin->cb_exit) {
+        ret = plugin->cb_exit();
+    }
+    flb_free(plugin->name);
+    flb_free(plugin);
+    return ret;
+}
+
+int proxy_go_input_register(struct flb_plugin_proxy *proxy,
+                            struct flb_plugin_proxy_def *def)
+{
+    struct flbgo_input_plugin *plugin;
+
+    plugin = flb_malloc(sizeof(struct flbgo_input_plugin));
+    if (!plugin) {
+        return -1;
+    }
+
+    /*
+     * Lookup the entry point function:
+     *
+     * - FLBPluginInit
+     * - FLBPluginInputCallback
+     * - FLBPluginExit
+     *
+     * note: registration callback FLBPluginRegister() is resolved by the
+     * parent proxy interface.
+     */
+
+    plugin->cb_init  = flb_plugin_proxy_symbol(proxy, "FLBPluginInit");
+    if (!plugin->cb_init) {
+        flb_error("[go proxy]: could not load FLBPluginInit symbol");
+        flb_free(plugin);
+        return -1;
+    }
+
+    plugin->cb_collect = flb_plugin_proxy_symbol(proxy, "FLBPluginInputCallback");
+    plugin->cb_cleanup = flb_plugin_proxy_symbol(proxy, "FLBPluginInputCleanupCallback");
+    plugin->cb_exit  = flb_plugin_proxy_symbol(proxy, "FLBPluginExit");
+    plugin->name     = flb_strdup(def->name);
+
+    /* This Go plugin context is an opaque data for the parent proxy */
+    proxy->data = plugin;
+
+    return 0;
+}
+
+int proxy_go_input_init(struct flb_plugin_proxy *proxy)
+{
+    int ret;
+    struct flbgo_input_plugin *plugin = proxy->data;
+
+    /* set the API */
+    plugin->api   = proxy->api;
+    plugin->i_ins = proxy->instance;
+    // In order to avoid having the whole instance as part of the ABI we
+    // copy the context pointer into the plugin.
+    plugin->context = ((struct flb_input_instance *)proxy->instance)->context;
+
+    ret = plugin->cb_init(plugin);
+    if (ret <= 0) {
+        flb_error("[go proxy]: plugin '%s' failed to initialize",
+                  plugin->name);
+        flb_free(plugin);
+        return -1;
+    }
+
+    return ret;
+}
+
+int proxy_go_input_collect(struct flb_plugin_proxy *ctx,
+                           void **collected_data, size_t *len)
+{
+    int ret;
+    void *data = NULL;
+    struct flbgo_input_plugin *plugin = ctx->data;
+
+    ret = plugin->cb_collect(&data, len);
+
+    *collected_data = data;
+
+    return ret;
+}
+
+int proxy_go_input_cleanup(struct flb_plugin_proxy *ctx,
+                           void *allocated_data)
+{
+    int ret = 0;
+    struct flbgo_input_plugin *plugin = ctx->data;
+
+    if (plugin->cb_cleanup) {
+        ret = plugin->cb_cleanup(allocated_data);
+    }
+
+    return ret;
+}
+
+int proxy_go_input_destroy(void *data)
+{
+    int ret = 0;
+    struct flbgo_input_plugin *plugin;
+
+    plugin = (struct flbgo_input_plugin *) data;
+    flb_debug("[GO] running exit callback");
+
+    ret = plugin->cb_exit();
+
+    flb_free(plugin->name);
+    flb_free(plugin);
     return ret;
 }

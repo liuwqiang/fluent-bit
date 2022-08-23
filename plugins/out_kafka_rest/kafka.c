@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -18,18 +17,75 @@
  *  limitations under the License.
  */
 
-#include <fluent-bit/flb_info.h>
-#include <fluent-bit/flb_output.h>
+#include <fluent-bit/flb_output_plugin.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_time.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_sds.h>
 #include <fluent-bit/flb_http_client.h>
+#include <fluent-bit/flb_config_map.h>
 #include <msgpack.h>
 
 #include "kafka.h"
 #include "kafka_conf.h"
 
+static struct flb_config_map config_map[] = {
+    {
+     FLB_CONFIG_MAP_STR, "message_key", NULL,
+     0, FLB_TRUE, offsetof(struct flb_kafka_rest, message_key),
+     "Specify a message key. "
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "time_key", NULL,
+     0, FLB_TRUE, offsetof(struct flb_kafka_rest, time_key),
+     "Specify the name of the field that holds the record timestamp. "
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "topic", "fluent-bit",
+     0, FLB_TRUE, offsetof(struct flb_kafka_rest, topic),
+     "Specify the kafka topic. "
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "url_path", NULL,
+     0, FLB_TRUE, offsetof(struct flb_kafka_rest, url_path),
+     "Specify an optional HTTP URL path for the target web server, e.g: /something"
+    },
+
+    {
+     FLB_CONFIG_MAP_DOUBLE, "partition", "-1",
+     0, FLB_TRUE, offsetof(struct flb_kafka_rest, partition),
+     "Specify kafka partition number. "
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "time_key_format", FLB_KAFKA_TIME_KEYF,
+     0, FLB_TRUE, offsetof(struct flb_kafka_rest, time_key_format),
+     "Specify the format of the timestamp. "
+    },
+
+    {
+     FLB_CONFIG_MAP_BOOL, "include_tag_key", "false",
+     0, FLB_TRUE, offsetof(struct flb_kafka_rest, include_tag_key),
+     "Specify whether to append tag name to final record. "
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "tag_key", "_flb-key",
+     0, FLB_TRUE, offsetof(struct flb_kafka_rest, tag_key),
+     "Specify the key name of the record if include_tag_key is enabled. "
+    },
+    {
+     FLB_CONFIG_MAP_BOOL, "avro_http_header", "false",
+     0, FLB_TRUE, offsetof(struct flb_kafka_rest, avro_http_header),
+     "Specify if the format has avro header in http request"
+    },
+
+    /* EOF */
+    {0}
+};
 /*
  * Convert the internal Fluent Bit data representation to the required
  * one by Kafka REST Proxy.
@@ -58,7 +114,7 @@ static flb_sds_t kafka_rest_format(const void *data, size_t bytes,
     msgpack_sbuffer mp_sbuf;
     msgpack_packer mp_pck;
 
-    /* Init temporal buffers */
+    /* Init temporary buffers */
     msgpack_sbuffer_init(&mp_sbuf);
     msgpack_packer_init(&mp_pck, &mp_sbuf, msgpack_sbuffer_write);
 
@@ -178,19 +234,19 @@ static int cb_kafka_init(struct flb_output_instance *ins,
 
     ctx = flb_kr_conf_create(ins, config);
     if (!ctx) {
-        flb_error("[out_kafka_rest] cannot initialize plugin");
+        flb_plg_error(ins, "cannot initialize plugin");
         return -1;
     }
 
-    flb_debug("[out_kafka_rest] host=%s port=%i",
-              ins->host.name, ins->host.port);
+    flb_plg_debug(ctx->ins, "host=%s port=%i",
+                  ins->host.name, ins->host.port);
     flb_output_set_context(ins, ctx);
 
     return 0;
 }
 
-static void cb_kafka_flush(const void *data, size_t bytes,
-                           const char *tag, int tag_len,
+static void cb_kafka_flush(struct flb_event_chunk *event_chunk,
+                           struct flb_output_flush *out_flush,
                            struct flb_input_instance *i_ins,
                            void *out_context,
                            struct flb_config *config)
@@ -203,8 +259,6 @@ static void cb_kafka_flush(const void *data, size_t bytes,
     struct flb_upstream_conn *u_conn;
     struct flb_kafka_rest *ctx = out_context;
     (void) i_ins;
-    (void) tag;
-    (void) tag_len;
 
     /* Get upstream connection */
     u_conn = flb_upstream_conn_get(ctx->u);
@@ -213,7 +267,9 @@ static void cb_kafka_flush(const void *data, size_t bytes,
     }
 
     /* Convert format */
-    js = kafka_rest_format(data, bytes, tag, tag_len, &js_size, ctx);
+    js = kafka_rest_format(event_chunk->data, event_chunk->size,
+                           event_chunk->tag, flb_sds_len(event_chunk->tag),
+                           &js_size, ctx);
     if (!js) {
         flb_upstream_conn_release(u_conn);
         FLB_OUTPUT_RETURN(FLB_ERROR);
@@ -223,33 +279,40 @@ static void cb_kafka_flush(const void *data, size_t bytes,
     c = flb_http_client(u_conn, FLB_HTTP_POST, ctx->uri,
                         js, js_size, NULL, 0, NULL, 0);
     flb_http_add_header(c, "User-Agent", 10, "Fluent-Bit", 10);
-    flb_http_add_header(c,
-                        "Content-Type", 12,
-                        "application/vnd.kafka.json.v2+json", 34);
-
+    if (ctx->avro_http_header == FLB_TRUE) {
+        flb_http_add_header(c,
+                            "Content-Type", 12,
+                            "application/vnd.kafka.avro.v2+json", 34);
+    }
+    else {
+        flb_http_add_header(c,
+                            "Content-Type", 12,
+                            "application/vnd.kafka.json.v2+json", 34);
+    }
+    
     if (ctx->http_user && ctx->http_passwd) {
         flb_http_basic_auth(c, ctx->http_user, ctx->http_passwd);
     }
 
     ret = flb_http_do(c, &b_sent);
     if (ret != 0) {
-        flb_warn("[out_kafka_rest] http_do=%i", ret);
+        flb_plg_warn(ctx->ins, "http_do=%i", ret);
         goto retry;
     }
     else {
         /* The request was issued successfully, validate the 'error' field */
-        flb_debug("[out_kafka_rest] HTTP Status=%i", c->resp.status);
+        flb_plg_debug(ctx->ins, "HTTP Status=%i", c->resp.status);
         if (c->resp.status != 200) {
             if (c->resp.payload_size > 0) {
-                flb_debug("[out_kafka_rest] Kafka REST response\n%s",
-                          c->resp.payload);
+                flb_plg_debug(ctx->ins, "Kafka REST response\n%s",
+                              c->resp.payload);
             }
             goto retry;
         }
 
         if (c->resp.payload_size > 0) {
-            flb_debug("[out_kafka_rest] Kafka REST response\n%s",
-                      c->resp.payload);
+            flb_plg_debug(ctx->ins, "Kafka REST response\n%s",
+                          c->resp.payload);
         }
         else {
             goto retry;
@@ -284,5 +347,6 @@ struct flb_output_plugin out_kafka_rest_plugin = {
     .cb_init      = cb_kafka_init,
     .cb_flush     = cb_kafka_flush,
     .cb_exit      = cb_kafka_exit,
+    .config_map   = config_map,
     .flags        = FLB_OUTPUT_NET | FLB_IO_OPT_TLS,
 };

@@ -42,24 +42,40 @@ static void test_context()
 {
     int flags;
     struct cio_ctx *ctx;
+    struct cio_options cio_opts;
 
     flags = CIO_CHECKSUM;
 
+    memset(&cio_opts, 0, sizeof(cio_opts));
+
+    cio_opts.flags = flags;
+    cio_opts.log_cb = NULL;
+
     /* Invalid path */
-    ctx = cio_create("", NULL, CIO_INFO, flags);
+    cio_opts.root_path = "";
+    cio_opts.log_level = CIO_LOG_INFO;
+
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx == NULL);
 
     /* Invalid debug level -1 */
-    ctx = cio_create("/tmp/", NULL, -1, flags);
+    cio_opts.root_path = "/tmp/";
+    cio_opts.log_level = -1;
+
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx == NULL);
 
-    /* Invalid debug level 5 */
-    ctx = cio_create("/tmp/", NULL, 5, flags);
+    /* Invalid debug level 6 */
+    cio_opts.log_level = 6;
+
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx == NULL);
 
     /* Valid context without callback */
     log_check = 0;
-    ctx = cio_create("/tmp/", NULL, CIO_INFO, flags);
+    cio_opts.log_level = CIO_LOG_INFO;
+
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx != NULL);
     cio_log_info(ctx, "test");
     TEST_CHECK(log_check == 0);
@@ -67,7 +83,9 @@ static void test_context()
 
     /* Valid with context callback */
     log_check = 0;
-    ctx = cio_create("/tmp/", log_cb, CIO_INFO, flags);
+    cio_opts.log_cb = log_cb;
+
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx != NULL);
     cio_log_info(ctx, "test");
     TEST_CHECK(log_check == 1);
@@ -77,10 +95,19 @@ static void test_context()
 static void test_log_level()
 {
     struct cio_ctx *ctx;
+    struct cio_options cio_opts;
+
+    memset(&cio_opts, 0, sizeof(cio_opts));
+
+    cio_opts.flags = 0;
+    cio_opts.log_cb = NULL;
 
     /* Logging with unset callback at creation, but set later */
     log_check = 0;
-    ctx = cio_create("/tmp/", NULL, CIO_INFO, 0);
+    cio_opts.root_path = "/tmp/";
+    cio_opts.log_level = CIO_LOG_INFO;
+
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx != NULL);
     cio_log_info(ctx, "test");
     TEST_CHECK(log_check == 0);
@@ -91,7 +118,7 @@ static void test_log_level()
     TEST_CHECK(log_check == 1);
 
     /* Test: CIO_ERROR */
-    cio_set_log_level(ctx, CIO_ERROR);
+    cio_set_log_level(ctx, CIO_LOG_ERROR);
     log_check = 0;
     cio_log_warn(ctx, "test");
     TEST_CHECK(log_check == 0);
@@ -99,7 +126,7 @@ static void test_log_level()
     TEST_CHECK(log_check == 1);
 
     /* Test: CIO_WARN */
-    cio_set_log_level(ctx, CIO_WARN);
+    cio_set_log_level(ctx, CIO_LOG_WARN);
     log_check = 0;
     cio_log_info(ctx, "test");
     TEST_CHECK(log_check == 0);
@@ -107,7 +134,7 @@ static void test_log_level()
     TEST_CHECK(log_check == 1);
 
     /* Test: CIO_INFO */
-    cio_set_log_level(ctx, CIO_INFO);
+    cio_set_log_level(ctx, CIO_LOG_INFO);
     log_check = 0;
     cio_log_debug(ctx, "test");
     TEST_CHECK(log_check == 0);
@@ -115,9 +142,17 @@ static void test_log_level()
     TEST_CHECK(log_check == 1);
 
     /* Test: CIO_DEBUG */
-    cio_set_log_level(ctx, CIO_DEBUG);
+    cio_set_log_level(ctx, CIO_LOG_DEBUG);
     log_check = 0;
+    cio_log_trace(ctx, "test");
+    TEST_CHECK(log_check == 0);
     cio_log_debug(ctx, "test");
+    TEST_CHECK(log_check == 1);
+
+    /* Test: CIO_TRACE */
+    cio_set_log_level(ctx, CIO_LOG_TRACE);
+    log_check = 0;
+    cio_log_trace(ctx, "test");
     TEST_CHECK(log_check == 1);
 
     /* destroy context */

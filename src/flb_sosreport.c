@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -74,8 +73,8 @@ static void input_flags(int flags)
         printf("NET ");
     }
 
-    if (flags & FLB_INPUT_THREAD) {
-        printf("THREAD ");
+    if (flags & FLB_INPUT_CORO) {
+        printf("CORO ");
     }
 
     printf("\n");
@@ -181,17 +180,10 @@ int flb_sosreport(struct flb_config *config)
     printf("Fluent Bit Enterprise - SOS Report\n");
     printf("==================================\n");
     printf("The following report aims to be used by Fluent Bit and Fluentd "
-           "Enterprise\nCustomers of Treasure Data. For more details visit:\n\n"
-           "    %shttps://fluentd.treasuredata.com%s\n\n", ANSI_BOLD, ANSI_RESET);
+           "community users.\n\n");
 
     /* Fluent Bit */
     printf("\n[Fluent Bit]\n");
-    printf("    Edition\t\t");
-#ifdef FLB_ENTERPRISE
-    printf("Enterprise\n");
-#else
-    printf("Community Edition\n");
-#endif
     printf("    Version\t\t%s\n", FLB_VERSION_STR);
     printf("    Built Flags\t\t%s\n", FLB_INFO_FLAGS);
     printf("\n");
@@ -257,7 +249,7 @@ int flb_sosreport(struct flb_config *config)
         printf("    Name\t\t%s (%s, id=%i)\n", ins_in->name, ins_in->p->name,
                ins_in->id);
         printf("    Flags\t\t"); input_flags(ins_in->flags);
-        printf("    Threaded\t\t%s\n", ins_in->threaded ? "Yes": "No");
+        printf("    Coroutines\t\t%s\n", ins_in->runs_in_coroutine ? "Yes": "No");
         if (ins_in->tag) {
             printf("    Tag\t\t\t%s\n", ins_in->tag);
         }
@@ -300,8 +292,8 @@ int flb_sosreport(struct flb_config *config)
     mk_list_foreach(head, &config->outputs) {
         ins_out = mk_list_entry(head, struct flb_output_instance, _head);
         printf("[OUTPUT] Instance\n");
-        printf("    Name\t\t%s (%s, mask_id=%" PRIu64 ")\n", ins_out->name, ins_out->p->name,
-               ins_out->mask_id);
+        printf("    Name\t\t%s (%s, id=%" PRIu64 ")\n", ins_out->name, ins_out->p->name,
+               (uint64_t) ins_out->id);
         printf("    Match\t\t%s\n", ins_out->match);
 
 #ifdef FLB_HAVE_TLS
@@ -315,7 +307,7 @@ int flb_sosreport(struct flb_config *config)
                    ins_out->tls_key_passwd ? "*****" : "(not set)");
         }
 #endif
-        if (ins_out->retry_limit == -1) {
+        if (ins_out->retry_limit == FLB_OUT_RETRY_UNLIMITED) {
             printf("    Retry Limit\t\tno limit\n");
         }
         else {

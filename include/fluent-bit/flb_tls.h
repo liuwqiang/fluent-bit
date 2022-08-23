@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,17 +22,18 @@
 
 #ifdef FLB_HAVE_TLS
 
-#include <fluent-bit/flb_thread.h>
+#include <fluent-bit/flb_info.h>
+#include <fluent-bit/flb_coro.h>
 #include <fluent-bit/flb_output.h>
 #include <fluent-bit/flb_upstream.h>
 
-int net_io_tls_write(struct flb_thread *th, struct flb_upstream_conn *u_conn,
+int net_io_tls_write(struct flb_coro *co, struct flb_upstream_conn *u_conn,
                      const void *data, size_t len, size_t *out_len);
-int net_io_tls_read(struct flb_thread *th, struct flb_upstream_conn *u_conn,
+int net_io_tls_read(struct flb_coro *co, struct flb_upstream_conn *u_conn,
                     void *buf, size_t len);
 
 int flb_io_tls_connect(struct flb_upstream_conn *u_conn,
-                       struct flb_thread *th);
+                       struct flb_coro *co);
 
 #endif /* FLB_HAVE_TLS */
 #endif

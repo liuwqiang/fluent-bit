@@ -32,7 +32,9 @@
 #include <mk_core/mk_string.h>
 #include <mk_core/mk_list.h>
 
-#ifdef _MSC_VER
+#ifdef _WIN32
+#include <Windows.h>
+#include <strsafe.h>
 #define PATH_MAX MAX_PATH
 #endif
 
@@ -41,7 +43,6 @@ static void mk_config_error(const char *path, int line, const char *msg)
 {
     mk_err("File %s", path);
     mk_err("Error in line %i: %s", line, msg);
-    exit(EXIT_FAILURE);
 }
 
 /* Raise a warning */
@@ -168,6 +169,31 @@ static int mk_rconf_meta_add(struct mk_rconf *conf, char *buf, int len)
     return 0;
 }
 
+static int check_indent(const char *line, const char *indent)
+{
+    while (*line == *indent && *indent) {
+        line++;
+        indent++;
+    }
+
+    if (*indent != '\0') {
+        if (isblank(*line)) {
+            mk_err("[config] Inconsistent use of tab and space");
+        }
+        else {
+            mk_err("[config] Indentation level is too low");
+        }
+        return -1;
+    }
+
+    if (isblank(*line)) {
+        mk_err("[config] Extra indentation level found");
+        return -1;
+    }
+
+    return 0;
+}
+
 /* To call this function from mk_rconf_read */
 static int mk_rconf_read_glob(struct mk_rconf *conf, const char * path);
 
@@ -231,10 +257,22 @@ static int mk_rconf_read(struct mk_rconf *conf, const char *path)
     /* looking for configuration directives */
     while (fgets(buf, MK_RCONF_KV_SIZE, f)) {
         len = strlen(buf);
-        if (buf[len - 1] == '\n') {
+        if (len > 0 && buf[len - 1] == '\n') {
             buf[--len] = 0;
             if (len && buf[len - 1] == '\r') {
                 buf[--len] = 0;
+            }
+        }
+        else {
+            /*
+             * If we don't find a break line, validate if we got an EOF or not. No EOF
+             * means that the incoming string is not finished so we must raise an
+             * exception.
+             */
+            if (!feof(f)) {
+                mk_config_error(path, line, "Length of content has exceeded limit");
+                mk_mem_free(buf);
+                return -1;
             }
         }
 
@@ -303,6 +341,8 @@ static int mk_rconf_read(struct mk_rconf *conf, const char *path)
             }
             else {
                 mk_config_error(path, line, "Bad header definition");
+                mk_mem_free(buf);
+                return -1;
             }
         }
 
@@ -322,12 +362,16 @@ static int mk_rconf_read(struct mk_rconf *conf, const char *path)
         }
 
         /* Validate indentation level */
-        if (strncmp(buf, indent, indent_len) != 0 ||
-            isblank(buf[indent_len]) != 0) {
+        if (check_indent(buf, indent) < 0) {
             mk_config_error(path, line, "Invalid indentation level");
+            return -1;
         }
 
         if (buf[indent_len] == '#' || indent_len == len) {
+            continue;
+        }
+
+        if (len - indent_len >= 3 && strncmp(buf + indent_len, "---", 3) == 0) {
             continue;
         }
 
@@ -338,6 +382,9 @@ static int mk_rconf_read(struct mk_rconf *conf, const char *path)
 
         if (!key || !val || i < 0) {
             mk_config_error(path, line, "Each key must have a value");
+            mk_mem_free(key);
+            mk_mem_free(val);
+            return -1;
         }
 
         /* Trim strings */
@@ -346,6 +393,9 @@ static int mk_rconf_read(struct mk_rconf *conf, const char *path)
 
         if (strlen(val) == 0) {
             mk_config_error(path, line, "Key has an empty value");
+            mk_mem_free(key);
+            mk_mem_free(val);
+            return -1;
         }
 
         /* Register entry: key and val are copied as duplicated */
@@ -398,7 +448,7 @@ static int mk_rconf_read(struct mk_rconf *conf, const char *path)
     return 0;
 }
 
-#ifndef _MSC_VER
+#ifndef _WIN32
 static int mk_rconf_read_glob(struct mk_rconf *conf, const char * path)
 {
     int ret = -1;
@@ -409,7 +459,7 @@ static int mk_rconf_read_glob(struct mk_rconf *conf, const char * path)
     size_t i;
     int ret_glb = -1;
 
-    if (conf->root_path) {
+    if (conf->root_path && path[0] != '/') {
         snprintf(tmp, PATH_MAX, "%s/%s", conf->root_path, path);
         glb_path = tmp;
     }
@@ -421,16 +471,16 @@ static int mk_rconf_read_glob(struct mk_rconf *conf, const char * path)
     if (ret_glb != 0) {
         switch(ret_glb){
         case GLOB_NOSPACE:
-            mk_warn("[%s] glob: no space", __FUNCTION__);
+            mk_warn("[%s] glob: [%s] no space", __FUNCTION__, glb_path);
             break;
         case GLOB_NOMATCH:
-            mk_warn("[%s] glob: no match", __FUNCTION__);
+            mk_warn("[%s] glob: [%s] no match", __FUNCTION__, glb_path);
             break;
         case GLOB_ABORTED:
-            mk_warn("[%s] glob: aborted", __FUNCTION__);
+            mk_warn("[%s] glob: [%s] aborted", __FUNCTION__, glb_path);
             break;
         default:
-            mk_warn("[%s] glob: other error", __FUNCTION__);
+            mk_warn("[%s] glob: [%s] other error", __FUNCTION__, glb_path);
         }
         return ret;
     }
@@ -446,11 +496,88 @@ static int mk_rconf_read_glob(struct mk_rconf *conf, const char * path)
     return ret;
 }
 #else
-static int mk_rconf_read_glob(struct mk_rconf *conf, const char * path)
+static int mk_rconf_read_glob(struct mk_rconf *conf, const char *path)
 {
-    mk_err("[config] wildcard is not supported on Windows");
-    mk_err("[config] path: %s", path);
-    return -1;
+    char *star, *p0, *p1;
+    char pattern[MAX_PATH];
+    char buf[MAX_PATH];
+    int ret;
+    struct stat st;
+    HANDLE h;
+    WIN32_FIND_DATA data;
+
+    if (strlen(path) > MAX_PATH - 1) {
+        return -1;
+    }
+
+    star = strchr(path, '*');
+    if (star == NULL) {
+        return -1;
+    }
+
+    /*
+     * C:\data\tmp\input_*.conf
+     *            0<-----|
+     */
+    p0 = star;
+    while (path <= p0 && *p0 != '\\') {
+        p0--;
+    }
+
+    /*
+     * C:\data\tmp\input_*.conf
+     *                   |---->1
+     */
+    p1 = star;
+    while (*p1 && *p1 != '\\') {
+        p1++;
+    }
+
+    memcpy(pattern, path, (p1 - path));
+    pattern[p1 - path] = '\0';
+
+    h = FindFirstFileA(pattern, &data);
+    if (h == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+
+    do {
+        /* Ignore the current and parent dirs */
+        if (!strcmp(".", data.cFileName) || !strcmp("..", data.cFileName)) {
+            continue;
+        }
+
+        /* Avoid an infinite loop */
+        if (strchr(data.cFileName, '*')) {
+            continue;
+        }
+
+        /* Create a path (prefix + filename + suffix) */
+        memcpy(buf, path, p0 - path + 1);
+        buf[p0 - path + 1] = '\0';
+
+        if (FAILED(StringCchCatA(buf, MAX_PATH, data.cFileName))) {
+            continue;
+        }
+        if (FAILED(StringCchCatA(buf, MAX_PATH, p1))) {
+            continue;
+        }
+
+        if (strchr(p1, '*')) {
+            mk_rconf_read_glob(conf, buf); /* recursive */
+            continue;
+        }
+
+        ret = stat(buf, &st);
+        if (ret == 0 && (st.st_mode & S_IFMT) == S_IFREG) {
+            if (mk_rconf_read(conf, buf) < 0) {
+                return -1;
+            }
+        }
+    } while (FindNextFileA(h, &data) != 0);
+
+    FindClose(h);
+    return 0;
 }
 #endif
 

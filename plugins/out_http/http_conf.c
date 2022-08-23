@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -18,13 +17,17 @@
  *  limitations under the License.
  */
 
-#include <fluent-bit/flb_info.h>
-#include <fluent-bit/flb_output.h>
+#include <fluent-bit/flb_output_plugin.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_sds.h>
 #include <fluent-bit/flb_kv.h>
-
+#include <fluent-bit/flb_record_accessor.h>
+#ifdef FLB_HAVE_SIGNV4
+#ifdef FLB_HAVE_AWS
+#include <fluent-bit/flb_aws_credentials.h>
+#endif
+#endif
 #include "http.h"
 #include "http_conf.h"
 
@@ -32,25 +35,57 @@ struct flb_out_http *flb_http_conf_create(struct flb_output_instance *ins,
                                           struct flb_config *config)
 {
     int ret;
-    int len;
     int ulen;
     int io_flags = 0;
+    char *protocol = NULL;
+    char *host = NULL;
+    char *port = NULL;
     char *uri = NULL;
     char *tmp_uri = NULL;
     const char *tmp;
     struct flb_upstream *upstream;
     struct flb_out_http *ctx = NULL;
-    struct mk_list *head;
-    struct mk_list *split = NULL;
-    struct flb_split_entry *sentry;
-    struct flb_kv *kv;
-    struct out_http_header *header;
 
     /* Allocate plugin context */
     ctx = flb_calloc(1, sizeof(struct flb_out_http));
     if (!ctx) {
         flb_errno();
         return NULL;
+    }
+    ctx->ins = ins;
+
+    ret = flb_output_config_map_set(ins, (void *) ctx);
+    if (ret == -1) {
+        flb_free(ctx);
+        return NULL;
+    }
+
+    if (ctx->headers_key && !ctx->body_key) {
+        flb_plg_error(ctx->ins, "when setting headers_key, body_key is also required");
+        flb_free(ctx);
+        return NULL;
+    }
+
+    if (ctx->body_key && !ctx->headers_key) {
+        flb_plg_error(ctx->ins, "when setting body_key, headers_key is also required");
+        flb_free(ctx);
+        return NULL;
+    }
+
+    if (ctx->body_key && ctx->headers_key) {
+        ctx->body_ra = flb_ra_create(ctx->body_key, FLB_FALSE);
+        if (!ctx->body_ra) {
+            flb_plg_error(ctx->ins, "failed to allocate body record accessor");
+            flb_free(ctx);
+            return NULL;
+        }
+
+        ctx->headers_ra = flb_ra_create(ctx->headers_key, FLB_FALSE);
+        if (!ctx->headers_ra) {
+            flb_plg_error(ctx->ins, "failed to allocate headers record accessor");
+            flb_free(ctx);
+            return NULL;
+        }
     }
 
     /*
@@ -60,53 +95,57 @@ struct flb_out_http *flb_http_conf_create(struct flb_output_instance *ins,
      */
     tmp = flb_output_get_property("proxy", ins);
     if (tmp) {
-        /*
-         * Here we just want to lookup two things: host and port, we are
-         * going to skip validations as most of them are handled by the HTTP
-         * Client in a later stage.
-         */
-        char *p;
-        char *addr;
-
-        addr = strstr(tmp, "//");
-        if (!addr) {
+        ret = flb_utils_url_split(tmp, &protocol, &host, &port, &uri);
+        if (ret == -1) {
+            flb_plg_error(ctx->ins, "could not parse proxy parameter: '%s'", tmp);
             flb_free(ctx);
             return NULL;
         }
-        addr += 2;              /* get right to the host section */
-        if (*addr == '[') {     /* IPv6 */
-            p = strchr(addr, ']');
-            if (!p) {
-                flb_free(ctx);
-                return NULL;
-            }
-            ctx->proxy_host = strndup(addr + 1, (p - addr - 1));
-            p++;
-            if (*p == ':') {
-                p++;
-                ctx->proxy_port = atoi(p);
-            }
-            else {
-            }
-        }
-        else {
-            /* Port lookup */
-            p = strchr(addr, ':');
-            if (p) {
-                p++;
-                ctx->proxy_port = atoi(p);
-                ctx->proxy_host = strndup(addr, (p - addr) - 1);
-            }
-            else {
-                ctx->proxy_host = flb_strdup(addr);
-                ctx->proxy_port = 80;
-            }
-        }
+
+        ctx->proxy_host = host;
+        ctx->proxy_port = atoi(port);
         ctx->proxy = tmp;
+        flb_free(protocol);
+        flb_free(port);
+        flb_free(uri);
+        uri = NULL;
     }
     else {
         flb_output_net_default("127.0.0.1", 80, ins);
     }
+
+    /* Check if AWS SigV4 authentication is enabled */
+#ifdef FLB_HAVE_SIGNV4
+#ifdef FLB_HAVE_AWS
+    if (ctx->has_aws_auth) {
+        ctx->aws_service = flb_output_get_property(FLB_HTTP_AWS_CREDENTIAL_PREFIX
+                                                   "service", ctx->ins);
+        if (!ctx->aws_service) {
+            flb_plg_error(ins, "aws_auth option requires " FLB_HTTP_AWS_CREDENTIAL_PREFIX
+                          "service to be set");
+            flb_free(ctx);
+            return NULL;
+        }
+
+        ctx->aws_provider = flb_managed_chain_provider_create(
+            ins,
+            config,
+            FLB_HTTP_AWS_CREDENTIAL_PREFIX,
+            NULL,
+            flb_aws_client_generator()
+        );
+        if (!ctx->aws_provider) {
+            flb_plg_error(ins, "failed to create aws credential provider for sigv4 auth");
+            flb_free(ctx);
+            return NULL;
+        }
+
+        /* If managed provider creation succeeds, then region key is present */
+        ctx->aws_region = flb_output_get_property(FLB_HTTP_AWS_CREDENTIAL_PREFIX
+                                                  "region", ctx->ins);
+    }
+#endif /* !FLB_HAVE_AWS */
+#endif /* !FLB_HAVE_SIGNV4 */
 
     /* Check if SSL/TLS is enabled */
 #ifdef FLB_HAVE_TLS
@@ -125,18 +164,18 @@ struct flb_out_http *flb_http_conf_create(struct flb_output_instance *ins,
     }
 
     if (ctx->proxy) {
-        flb_trace("[out_http] Upstream Proxy=%s:%i",
-                  ctx->proxy_host, ctx->proxy_port);
+        flb_plg_trace(ctx->ins, "Upstream Proxy=%s:%i",
+                      ctx->proxy_host, ctx->proxy_port);
         upstream = flb_upstream_create(config,
                                        ctx->proxy_host,
                                        ctx->proxy_port,
-                                       io_flags, (void *)&ins->tls);
+                                       io_flags, ins->tls);
     }
     else {
         upstream = flb_upstream_create(config,
                                        ins->host.name,
                                        ins->host.port,
-                                       io_flags, (void *)&ins->tls);
+                                       io_flags, ins->tls);
     }
 
     if (!upstream) {
@@ -167,29 +206,6 @@ struct flb_out_http *flb_http_conf_create(struct flb_output_instance *ins,
         uri = tmp_uri;
     }
 
-    /* HTTP Auth */
-    tmp = flb_output_get_property("http_user", ins);
-    if (tmp) {
-        ctx->http_user = flb_strdup(tmp);
-
-        tmp = flb_output_get_property("http_passwd", ins);
-        if (tmp) {
-            ctx->http_passwd = flb_strdup(tmp);
-        }
-        else {
-            ctx->http_passwd = flb_strdup("");
-        }
-    }
-
-    /* Tag in header */
-    tmp = flb_output_get_property("header_tag", ins);
-    if (tmp) {
-      ctx->header_tag = flb_strdup(tmp);
-      ctx->headertag_len = strlen(ctx->header_tag);
-      flb_info("[out_http] configure to pass tag in header: %s",
-               ctx->header_tag);
-    }
-
     /* Output format */
     ctx->out_format = FLB_PACK_JSON_FORMAT_NONE;
     tmp = flb_output_get_property("format", ins);
@@ -200,12 +216,22 @@ struct flb_out_http *flb_http_conf_create(struct flb_output_instance *ins,
         else {
             ret = flb_pack_to_json_format_type(tmp);
             if (ret == -1) {
-                flb_error("[out_http] unrecognized 'format' option. "
-                          "Using 'msgpack'");
+                flb_plg_error(ctx->ins, "unrecognized 'format' option. "
+                              "Using 'msgpack'");
             }
             else {
                 ctx->out_format = ret;
             }
+        }
+    }
+
+    /* Date key */
+    ctx->date_key = ctx->json_date_key;
+    tmp = flb_output_get_property("json_date_key", ins);
+    if (tmp) {
+        /* Just check if we have to disable it */
+        if (flb_utils_bool(tmp) == FLB_FALSE) {
+            ctx->date_key = NULL;
         }
     }
 
@@ -215,51 +241,12 @@ struct flb_out_http *flb_http_conf_create(struct flb_output_instance *ins,
     if (tmp) {
         ret = flb_pack_to_json_date_type(tmp);
         if (ret == -1) {
-            flb_error("[out_http] unrecognized 'json_date_format' option. "
-                      "Using 'double'.");
+            flb_plg_error(ctx->ins, "unrecognized 'json_date_format' option. "
+                          "Using 'double'.");
         }
         else {
             ctx->json_date_format = ret;
         }
-    }
-
-    /* Date key for JSON output */
-    tmp = flb_output_get_property("json_date_key", ins);
-    if (tmp) {
-        ctx->json_date_key = flb_sds_create(tmp);
-    }
-    else {
-        ctx->json_date_key = flb_sds_create("date");
-    }
-
-    /* Config Gelf_Timestamp_Key */
-    tmp = flb_output_get_property("gelf_timestamp_key", ins);
-    if (tmp) {
-        ctx->gelf_fields.timestamp_key = flb_sds_create(tmp);
-    }
-
-    /* Config Gelf_Host_Key */
-    tmp = flb_output_get_property("gelf_host_key", ins);
-    if (tmp) {
-        ctx->gelf_fields.host_key = flb_sds_create(tmp);
-    }
-
-    /* Config Gelf_Short_Message_Key */
-    tmp = flb_output_get_property("gelf_short_message_key", ins);
-    if (tmp) {
-        ctx->gelf_fields.short_message_key = flb_sds_create(tmp);
-    }
-
-    /* Config Gelf_Full_Message_Key */
-    tmp = flb_output_get_property("gelf_full_message_key", ins);
-    if (tmp) {
-        ctx->gelf_fields.full_message_key = flb_sds_create(tmp);
-    }
-
-    /* Config Gelf_Level_Key */
-    tmp = flb_output_get_property("gelf_level_key", ins);
-    if (tmp) {
-        ctx->gelf_fields.level_key = flb_sds_create(tmp);
     }
 
     /* Compress (gzip) */
@@ -276,96 +263,36 @@ struct flb_out_http *flb_http_conf_create(struct flb_output_instance *ins,
     ctx->host = ins->host.name;
     ctx->port = ins->host.port;
 
-    /* Arbitrary HTTP headers to add */
-    ctx->headers_cnt = 0;
-    mk_list_init(&ctx->headers);
-
-    mk_list_foreach(head, &ins->properties) {
-        kv = mk_list_entry(head, struct flb_kv, _head);
-        split = flb_utils_split(kv->val, ' ', 1);
-
-        if (!split) {
-            continue;
-        }
-
-        if (strcasecmp(kv->key, "header") == 0) {
-            header = flb_malloc(sizeof(struct out_http_header));
-            if (!header) {
-                flb_errno();
-                flb_utils_split_free(split);
-                flb_http_conf_destroy(ctx);
-                return NULL;
-            }
-
-            sentry = mk_list_entry_first(split, struct flb_split_entry,
-                                         _head);
-
-            len = flb_sds_len(kv->val);
-            if (sentry->last_pos == len) {
-                /* Missing value */
-                flb_error("[out_http] missing header value");
-                flb_free(header);
-                flb_utils_split_free(split);
-                flb_http_conf_destroy(ctx);
-                return NULL;
-            }
-
-            /* Header Name */
-            header->key_len = strlen(sentry->value);
-            header->key = flb_strndup(sentry->value, header->key_len);
-
-            /*
-             * Header Value: compose using the offset value from
-             * the first split entry.
-             */
-            header->val = flb_strndup(kv->val + sentry->last_pos,
-                                      len - sentry->last_pos);
-            header->val_len = strlen(header->val);
-            mk_list_add(&header->_head, &ctx->headers);
-
-            ctx->headers_cnt++;
-        }
-        flb_utils_split_free(split);
-    }
+    /* Set instance flags into upstream */
+    flb_output_upstream_set(ctx->u, ins);
 
     return ctx;
 }
 
 void flb_http_conf_destroy(struct flb_out_http *ctx)
 {
-    struct mk_list *tmp;
-    struct mk_list *head;
-    struct out_http_header *header;
-
     if (!ctx) {
         return;
+    }
+
+    if (ctx->body_ra && ctx->headers_ra) {
+        flb_ra_destroy(ctx->body_ra);
+        flb_ra_destroy(ctx->headers_ra);
     }
 
     if (ctx->u) {
         flb_upstream_destroy(ctx->u);
     }
 
-    flb_free(ctx->http_user);
-    flb_free(ctx->http_passwd);
+#ifdef FLB_HAVE_SIGNV4
+#ifdef FLB_HAVE_AWS
+    if (ctx->aws_provider) {
+        flb_aws_provider_destroy(ctx->aws_provider);
+    }
+#endif
+#endif
+
     flb_free(ctx->proxy_host);
     flb_free(ctx->uri);
-    flb_free(ctx->header_tag);
-    flb_sds_destroy(ctx->json_date_key);
-
-    mk_list_foreach_safe(head, tmp, &ctx->headers) {
-        header = mk_list_entry(head, struct out_http_header, _head);
-        flb_free(header->key);
-        flb_free(header->val);
-        mk_list_del(&header->_head);
-        flb_free(header);
-    }
-
-    flb_sds_destroy(ctx->gelf_fields.timestamp_key);
-    flb_sds_destroy(ctx->gelf_fields.host_key);
-    flb_sds_destroy(ctx->gelf_fields.short_message_key);
-    flb_sds_destroy(ctx->gelf_fields.full_message_key);
-    flb_sds_destroy(ctx->gelf_fields.level_key);
-
     flb_free(ctx);
-    ctx = NULL;
 }

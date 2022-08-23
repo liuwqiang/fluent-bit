@@ -2,9 +2,8 @@
 
 /*  Serial input plugin for Fluent Bit
  *  ==================================
- *  Copyright (C) 2019      The Fluent Bit Authors
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *  Copyright (C) 2015-2016 Takeshi HASEGAWA
- *  Copyright (C) 2015-2018 Treasure Data Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -96,7 +95,7 @@ static inline void consume_bytes(char *buf, int bytes, int length)
 }
 
 /* Callback triggered when some serial msgs are available */
-static int in_serial_collect(struct flb_input_instance *in,
+static int cb_serial_collect(struct flb_input_instance *in,
                              struct flb_config *config, void *in_context)
 {
     int ret;
@@ -238,7 +237,7 @@ static int in_serial_collect(struct flb_input_instance *in,
 }
 
 /* Cleanup serial input */
-int in_serial_exit(void *in_context, struct flb_config *config)
+static int cb_serial_exit(void *in_context, struct flb_config *config)
 {
     struct flb_in_serial_config *ctx = in_context;
 
@@ -252,8 +251,8 @@ int in_serial_exit(void *in_context, struct flb_config *config)
 }
 
 /* Init serial input */
-int in_serial_init(struct flb_input_instance *in,
-                   struct flb_config *config, void *data)
+static int cb_serial_init(struct flb_input_instance *in,
+                          struct flb_config *config, void *data)
 {
     int fd;
     int ret;
@@ -263,12 +262,13 @@ int in_serial_init(struct flb_input_instance *in,
 
     ctx = flb_calloc(1, sizeof(struct flb_in_serial_config));
     if (!ctx) {
-        perror("calloc");
+        flb_errno();
         return -1;
     }
     ctx->format = FLB_SERIAL_FORMAT_NONE;
 
     if (!serial_config_read(ctx, in)) {
+        flb_free(ctx);
         return -1;
     }
 
@@ -320,13 +320,13 @@ int in_serial_init(struct flb_input_instance *in,
 #if __linux__
     /* Set our collector based on a file descriptor event */
     ret = flb_input_set_collector_event(in,
-                                        in_serial_collect,
+                                        cb_serial_collect,
                                         ctx->fd,
                                         config);
 #else
     /* Set our collector based on a timer event */
     ret = flb_input_set_collector_time(in,
-                                       in_serial_collect,
+                                       cb_serial_collect,
                                        IN_SERIAL_COLLECT_SEC,
                                        IN_SERIAL_COLLECT_NSEC,
                                        config);
@@ -339,13 +339,44 @@ int in_serial_init(struct flb_input_instance *in,
     return 0;
 }
 
+static struct flb_config_map config_map[] = {
+    {
+     FLB_CONFIG_MAP_STR, "file", (char *)NULL,
+     0, FLB_TRUE, offsetof(struct flb_in_serial_config, file),
+     "Set the serial character device file name"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "bitrate", (char *)NULL,
+     0, FLB_TRUE, offsetof(struct flb_in_serial_config, bitrate),
+     "Set the serial bitrate (baudrate)"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "separator", (char *)NULL,
+     0, FLB_TRUE, offsetof(struct flb_in_serial_config, separator),
+     "Set the record separator"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "format", (char *)NULL,
+     0, FLB_TRUE, offsetof(struct flb_in_serial_config, format_str),
+     "Set the serial format: json or none"
+    },
+    {
+     FLB_CONFIG_MAP_INT, "min_bytes", "0",
+     0, FLB_TRUE, offsetof(struct flb_in_serial_config, min_bytes),
+     "Set the serial minimum bytes"
+    },
+    /* EOF */
+    {0}
+};
+
 /* Plugin reference */
 struct flb_input_plugin in_serial_plugin = {
     .name         = "serial",
     .description  = "Serial input",
-    .cb_init      = in_serial_init,
+    .cb_init      = cb_serial_init,
     .cb_pre_run   = NULL,
-    .cb_collect   = in_serial_collect,
+    .cb_collect   = cb_serial_collect,
     .cb_flush_buf = NULL,
-    .cb_exit      = in_serial_exit
+    .cb_exit      = cb_serial_exit,
+    .config_map   = config_map,
 };

@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -18,7 +17,7 @@
  *  limitations under the License.
  */
 
-#include <fluent-bit/flb_info.h>
+#include <fluent-bit/flb_input_plugin.h>
 #include <fluent-bit/flb_config.h>
 #include <fluent-bit/flb_pack.h>
 #include <msgpack.h>
@@ -99,7 +98,8 @@ struct flb_in_proc_mem_offset mem_linux[] = {
 
 
 
-static pid_t get_pid_from_procname_linux(const char* proc)
+static pid_t get_pid_from_procname_linux(struct flb_in_proc_config *ctx,
+                                         const char* proc)
 {
     pid_t ret = -1;
     glob_t glb;
@@ -116,16 +116,16 @@ static pid_t get_pid_from_procname_linux(const char* proc)
     if (ret_glb != 0) {
         switch(ret_glb){
         case GLOB_NOSPACE:
-            flb_warn("[%s] glob: no space", FLB_IN_PROC_NAME);
+            flb_plg_warn(ctx->ins, "glob: no space");
             break;
         case GLOB_NOMATCH:
-            flb_warn("[%s] glob: no match", FLB_IN_PROC_NAME);
+            flb_plg_warn(ctx->ins, "glob: no match");
             break;
         case GLOB_ABORTED:
-            flb_warn("[%s] glob: aborted", FLB_IN_PROC_NAME);
+            flb_plg_warn(ctx->ins, "glob: aborted");
             break;
         default:
-            flb_warn("[%s] glob: other error", FLB_IN_PROC_NAME);
+            flb_plg_warn(ctx->ins, "glob: other error");
         }
         return ret;
     }
@@ -158,66 +158,22 @@ static pid_t get_pid_from_procname_linux(const char* proc)
 static int configure(struct flb_in_proc_config *ctx,
                      struct flb_input_instance *in)
 {
-    const char *pval = NULL;
+    int ret;
 
-    /* interval settings */
-    pval = flb_input_get_property("interval_sec", in);
-    if (pval != NULL && atoi(pval) >= 0) {
-        ctx->interval_sec = atoi(pval);
+    /* Load the config map */
+    ret = flb_input_config_map_set(in, (void *)ctx);
+    if (ret == -1) {
+        flb_plg_error(in, "unable to load configuration");
+        return -1;
     }
-    else {
-        ctx->interval_sec = DEFAULT_INTERVAL_SEC;
-    }
-
-    pval = flb_input_get_property("interval_nsec", in);
-    if (pval != NULL && atoi(pval) >= 0) {
-        ctx->interval_nsec = atoi(pval);
-    }
-    else {
-        ctx->interval_nsec = DEFAULT_INTERVAL_NSEC;
-    }
-
+    
     if (ctx->interval_sec <= 0 && ctx->interval_nsec <= 0) {
         /* Illegal settings. Override them. */
-        ctx->interval_sec = DEFAULT_INTERVAL_SEC;
-        ctx->interval_nsec = DEFAULT_INTERVAL_NSEC;
+        ctx->interval_sec = atoi(DEFAULT_INTERVAL_SEC);
+        ctx->interval_nsec = atoi(DEFAULT_INTERVAL_NSEC);
     }
 
-    pval = flb_input_get_property("alert", in);
-    if (pval) {
-        if (strcasecmp(pval, "true") == 0 || strcasecmp(pval, "on") == 0) {
-            ctx->alert = FLB_TRUE;
-        }
-    }
-
-    pval = flb_input_get_property("mem", in);
-    if (pval) {
-        if (strcasecmp(pval, "true") == 0 || strcasecmp(pval, "on") == 0) {
-            ctx->mem = FLB_TRUE;
-        }
-        else if (strcasecmp(pval, "false") == 0 || strcasecmp(pval, "off") == 0) {
-            ctx->mem = FLB_FALSE;
-        }
-    }
-
-    pval = flb_input_get_property("fd", in);
-    if (pval) {
-        if (strcasecmp(pval, "true") == 0 || strcasecmp(pval, "on") == 0) {
-            ctx->fds = FLB_TRUE;
-        }
-        else if (strcasecmp(pval, "false") == 0 || strcasecmp(pval, "off") == 0) {
-            ctx->fds = FLB_FALSE;
-        }
-    }
-
-    pval = flb_input_get_property("proc_name", in);
-    if (pval) {
-        ctx->proc_name = (char*)flb_malloc(FLB_CMD_LEN);
-        if (ctx->proc_name == NULL) {
-            return -1;
-        }
-        strncpy(ctx->proc_name, pval, FLB_CMD_LEN);
-        ctx->proc_name[FLB_CMD_LEN-1] = '\0';
+    if (ctx->proc_name != NULL && strcmp(ctx->proc_name, "") != 0) {
         ctx->len_proc_name = strlen(ctx->proc_name);
     }
 
@@ -355,7 +311,7 @@ static int update_mem_linux(struct flb_in_proc_config *ctx,
     fp = fopen(path, "r");
 
     if (fp == NULL) {
-        flb_error("[%s] %s open error",FLB_IN_PROC_NAME, path);
+        flb_plg_error(ctx->ins, "open error: %s", path);
         mem_linux_clear(mem_stat);
         return -1;
     }
@@ -414,7 +370,7 @@ static int update_fds_linux(struct flb_in_proc_config *ctx,
     dirp = opendir(path);
     if (dirp == NULL) {
         perror("opendir");
-        flb_error("[%s] opendir error %s",FLB_IN_PROC_NAME, path);
+        flb_plg_error(ctx->ins, "opendir error %s", path);
         return -1;
     }
 
@@ -437,7 +393,7 @@ static int in_proc_collect_linux(struct flb_input_instance *i_ins,
     struct flb_in_proc_mem_linux mem;
 
     if (ctx->proc_name != NULL){
-        ctx->pid = get_pid_from_procname_linux(ctx->proc_name);
+        ctx->pid = get_pid_from_procname_linux(ctx, ctx->proc_name);
         update_alive(ctx);
 
         if (ctx->mem == FLB_TRUE && ctx->alive == FLB_TRUE) {
@@ -463,7 +419,6 @@ static int in_proc_init(struct flb_input_instance *in,
                           struct flb_config *config, void *data)
 {
     int ret;
-
     struct flb_in_proc_config *ctx = NULL;
     (void) data;
 
@@ -478,11 +433,12 @@ static int in_proc_init(struct flb_input_instance *in,
     ctx->fds   = FLB_TRUE;
     ctx->proc_name = NULL;
     ctx->pid = -1;
+    ctx->ins = in;
 
     configure(ctx, in);
 
     if (ctx->proc_name == NULL) {
-        flb_error("[%s] \"proc_name\" is NULL", FLB_IN_PROC_NAME);
+        flb_plg_error(ctx->ins, "'proc_name' is not set");
         flb_free(ctx);
         return -1;
     }
@@ -497,7 +453,7 @@ static int in_proc_init(struct flb_input_instance *in,
                                        ctx->interval_nsec,
                                        config);
     if (ret == -1) {
-        flb_error("Could not set collector for Proc input plugin");
+        flb_plg_error(ctx->ins, "could not set collector for Proc input plugin");
         flb_free(ctx);
         return -1;
     }
@@ -510,12 +466,50 @@ static int in_proc_exit(void *data, struct flb_config *config)
     (void) *config;
     struct flb_in_proc_config *ctx = data;
 
+    if (!ctx) {
+        return 0;
+    }
+
     /* Destroy context */
-    flb_free(ctx->proc_name);
     flb_free(ctx);
 
     return 0;
 }
+
+static struct flb_config_map config_map[] = {
+    {
+      FLB_CONFIG_MAP_INT, "interval_sec", DEFAULT_INTERVAL_SEC,
+      0, FLB_TRUE, offsetof(struct flb_in_proc_config, interval_sec),
+      "Set the collector interval"
+    },
+    {
+      FLB_CONFIG_MAP_INT, "interval_nsec", DEFAULT_INTERVAL_NSEC,
+      0, FLB_TRUE, offsetof(struct flb_in_proc_config, interval_nsec),
+      "Set the collector interval (nanoseconds)"
+    },
+    {
+     FLB_CONFIG_MAP_BOOL, "alert", "false",
+     0, FLB_TRUE, offsetof(struct flb_in_proc_config, alert),
+     "Only generate alerts if process is down"
+    },
+    {
+     FLB_CONFIG_MAP_BOOL, "mem", "true",
+     0, FLB_TRUE, offsetof(struct flb_in_proc_config, mem),
+     "Append memory usage to record"
+    },
+    {
+     FLB_CONFIG_MAP_BOOL, "fd", "true",
+     0, FLB_TRUE, offsetof(struct flb_in_proc_config, fds),
+     "Append fd count to record"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "proc_name", NULL,
+     0, FLB_TRUE, offsetof(struct flb_in_proc_config, proc_name),
+     "Define process name to health check"
+    },
+    /* EOF */
+    {0}
+};
 
 /* Plugin reference */
 struct flb_input_plugin in_proc_plugin = {
@@ -526,5 +520,6 @@ struct flb_input_plugin in_proc_plugin = {
     .cb_collect   = in_proc_collect,
     .cb_flush_buf = NULL,
     .cb_exit      = in_proc_exit,
+    .config_map   = config_map,
     .flags        = 0,
 };

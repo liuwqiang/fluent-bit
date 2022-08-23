@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,7 +26,6 @@ struct flb_kube;
 
 struct flb_kube_meta {
     int fields;
-    int skip;
 
     int namespace_len;
     int podname_len;
@@ -35,10 +33,12 @@ struct flb_kube_meta {
     int container_name_len;
     int docker_id_len;
     int container_hash_len;
+    int container_image_len;
 
     char *namespace;
     char *podname;
     char *container_name;
+    char *container_image;
     char *docker_id;
 
     char *container_hash;   /* set only on Systemd mode */
@@ -53,6 +53,7 @@ struct flb_kube_meta {
 #define FLB_KUBE_API_HOST "kubernetes.default.svc"
 #define FLB_KUBE_API_PORT 443
 #define FLB_KUBE_API_FMT "/api/v1/namespaces/%s/pods/%s"
+#define FLB_KUBELET_PODS "/pods"
 
 int flb_kube_meta_init(struct flb_kube *ctx, struct flb_config *config);
 int flb_kube_meta_fetch(struct flb_kube *ctx);

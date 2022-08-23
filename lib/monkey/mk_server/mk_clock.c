@@ -19,14 +19,17 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <pthread.h>
 #include <time.h>
-#include <unistd.h>
+
+#include <mk_core/mk_pthread.h>
+#include <mk_core/mk_unistd.h>
 
 #include <monkey/mk_core.h>
 #include <monkey/mk_config.h>
 #include <monkey/mk_clock.h>
 #include <monkey/mk_utils.h>
+
+pthread_t mk_clock_tid;
 
 time_t log_current_utime;
 time_t monkey_init_time;
@@ -36,6 +39,23 @@ mk_ptr_t headers_preset = { NULL, HEADER_PRESET_SIZE - 1 };
 
 static char *log_time_buffers[2];
 static char *header_time_buffers[2];
+
+#ifdef _WIN32
+static struct tm* localtime_r(const time_t* timep, struct tm* result)
+{
+    localtime_s(result, timep);
+
+    return result;
+}
+
+static struct tm* gmtime_r(const time_t* timep, struct tm* result)
+{
+    gmtime_s(result, timep);
+
+    return result;
+}
+#endif
+
 
 /*
  * The mk_ptr_ts have two buffers for avoid in half-way access from
@@ -99,6 +119,7 @@ void *mk_clock_worker_init(void *data)
 
     mk_utils_worker_rename("monkey: clock");
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
 
     mk_clock_tid = pthread_self();
 

@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -22,38 +21,337 @@
 #include <fluent-bit/flb_input.h>
 #include <fluent-bit/flb_log.h>
 #include <fluent-bit/flb_storage.h>
+#include <fluent-bit/flb_scheduler.h>
+#include <fluent-bit/flb_utils.h>
+#include <fluent-bit/flb_http_server.h>
+
+static void metrics_append_general(msgpack_packer *mp_pck,
+                                   struct flb_config *ctx,
+                                   struct flb_storage_metrics *sm)
+{
+    struct cio_stats storage_st;
+
+    /* Retrieve general stats from the storage layer */
+    cio_stats_get(ctx->cio, &storage_st);
+
+    msgpack_pack_str(mp_pck, 13);
+    msgpack_pack_str_body(mp_pck, "storage_layer", 13);
+    msgpack_pack_map(mp_pck, 1);
+
+    /* Chunks */
+    msgpack_pack_str(mp_pck, 6);
+    msgpack_pack_str_body(mp_pck, "chunks", 6);
+    msgpack_pack_map(mp_pck, 5);
+
+    /* chunks['total_chunks'] */
+    msgpack_pack_str(mp_pck, 12);
+    msgpack_pack_str_body(mp_pck, "total_chunks", 12);
+    msgpack_pack_uint64(mp_pck, storage_st.chunks_total);
+
+    /* chunks['mem_chunks'] */
+    msgpack_pack_str(mp_pck, 10);
+    msgpack_pack_str_body(mp_pck, "mem_chunks", 10);
+    msgpack_pack_uint64(mp_pck, storage_st.chunks_mem);
+
+    /* chunks['fs_chunks'] */
+    msgpack_pack_str(mp_pck, 9);
+    msgpack_pack_str_body(mp_pck, "fs_chunks", 9);
+    msgpack_pack_uint64(mp_pck, storage_st.chunks_fs);
+
+    /* chunks['fs_up_chunks'] */
+    msgpack_pack_str(mp_pck, 12);
+    msgpack_pack_str_body(mp_pck, "fs_chunks_up", 12);
+    msgpack_pack_uint64(mp_pck, storage_st.chunks_fs_up);
+
+    /* chunks['fs_down_chunks'] */
+    msgpack_pack_str(mp_pck, 14);
+    msgpack_pack_str_body(mp_pck, "fs_chunks_down", 14);
+    msgpack_pack_uint64(mp_pck, storage_st.chunks_fs_down);
+}
+
+static void metrics_append_input(msgpack_packer *mp_pck,
+                                 struct flb_config *ctx,
+                                 struct flb_storage_metrics *sm)
+{
+    int len;
+    int ret;
+    const char *tmp;
+    char buf[32];
+    ssize_t size;
+
+    /* chunks */
+    int up;
+    int down;
+    int busy;
+    int busy_size_err;
+    ssize_t busy_size;
+    struct mk_list *head;
+    struct mk_list *h_chunks;
+    struct flb_input_instance *i;
+    struct flb_input_chunk *ic;
+
+    msgpack_pack_str(mp_pck, 12);
+    msgpack_pack_str_body(mp_pck, "input_chunks", 12);
+    msgpack_pack_map(mp_pck, mk_list_size(&ctx->inputs));
+
+    /* Input Plugins Ingestion */
+    mk_list_foreach(head, &ctx->inputs) {
+        i = mk_list_entry(head, struct flb_input_instance, _head);
+
+        tmp = flb_input_name(i);
+        len = strlen(tmp);
+
+        msgpack_pack_str(mp_pck, len);
+        msgpack_pack_str_body(mp_pck, tmp, len);
+
+        /* Map for 'status' and 'chunks' */
+        msgpack_pack_map(mp_pck, 2);
+
+        /*
+         * Status
+         * ======
+         */
+        msgpack_pack_str(mp_pck, 6);
+        msgpack_pack_str_body(mp_pck, "status", 6);
+
+        /* 'status' map has 2 keys: overlimit and chunks */
+        msgpack_pack_map(mp_pck, 3);
+
+        /* status['overlimit'] */
+        msgpack_pack_str(mp_pck, 9);
+        msgpack_pack_str_body(mp_pck, "overlimit", 9);
+
+        ret = FLB_FALSE;
+        if (i->mem_buf_limit > 0) {
+            if (i->mem_chunks_size >= i->mem_buf_limit) {
+                ret = FLB_TRUE;
+            }
+        }
+        if (ret == FLB_TRUE) {
+            msgpack_pack_true(mp_pck);
+        }
+        else {
+            msgpack_pack_false(mp_pck);
+        }
+
+        /* status['mem_size'] */
+        msgpack_pack_str(mp_pck, 8);
+        msgpack_pack_str_body(mp_pck, "mem_size", 8);
+
+        /* Current memory size used based on last ingestion */
+        flb_utils_bytes_to_human_readable_size(i->mem_chunks_size,
+                                               buf, sizeof(buf) - 1);
+        len = strlen(buf);
+        msgpack_pack_str(mp_pck, len);
+        msgpack_pack_str_body(mp_pck, buf, len);
+
+        /* status['mem_limit'] */
+        msgpack_pack_str(mp_pck, 9);
+        msgpack_pack_str_body(mp_pck, "mem_limit", 9);
+
+        flb_utils_bytes_to_human_readable_size(i->mem_buf_limit,
+                                               buf, sizeof(buf) - 1);
+        len = strlen(buf);
+        msgpack_pack_str(mp_pck, len);
+        msgpack_pack_str_body(mp_pck, buf, len);
+
+        /*
+         * Chunks
+         * ======
+         */
+        msgpack_pack_str(mp_pck, 6);
+        msgpack_pack_str_body(mp_pck, "chunks", 6);
+
+        /* 'chunks' has 3 keys: total, up, down, busy and busy_size */
+        msgpack_pack_map(mp_pck, 5);
+
+        /* chunks['total_chunks'] */
+        msgpack_pack_str(mp_pck, 5);
+        msgpack_pack_str_body(mp_pck, "total", 5);
+        msgpack_pack_uint64(mp_pck, mk_list_size(&i->chunks));
+
+        /*
+         * chunks Details: chunks marked as 'busy' are 'locked' since they are in
+         * a 'flush' state. No more data can be appended to a busy chunk.
+         */
+        busy = 0;
+        busy_size = 0;
+        busy_size_err = 0;
+
+        /* up/down */
+        up = 0;
+        down = 0;
+
+        /* Iterate chunks for the input instance in question */
+        mk_list_foreach(h_chunks, &i->chunks) {
+            ic = mk_list_entry(h_chunks, struct flb_input_chunk, _head);
+            if (ic->busy == FLB_TRUE) {
+                busy++;
+                size = cio_chunk_get_content_size(ic->chunk);
+                if (size >= 0) {
+                    busy_size += size;
+                }
+                else {
+                    busy_size_err++;
+                }
+            }
+
+            if (cio_chunk_is_up(ic->chunk) == CIO_TRUE) {
+                up++;
+            }
+            else {
+                down++;
+            }
+
+        }
+
+        /* chunks['up'] */
+        msgpack_pack_str(mp_pck, 2);
+        msgpack_pack_str_body(mp_pck, "up", 2);
+        msgpack_pack_uint64(mp_pck, up);
+
+        /* chunks['down'] */
+        msgpack_pack_str(mp_pck, 4);
+        msgpack_pack_str_body(mp_pck, "down", 4);
+        msgpack_pack_uint64(mp_pck, down);
+
+        /* chunks['busy'] */
+        msgpack_pack_str(mp_pck, 4);
+        msgpack_pack_str_body(mp_pck, "busy", 4);
+        msgpack_pack_uint64(mp_pck, busy);
+
+        /* chunks['busy_size'] */
+        msgpack_pack_str(mp_pck, 9);
+        msgpack_pack_str_body(mp_pck, "busy_size", 9);
+
+        flb_utils_bytes_to_human_readable_size(busy_size, buf, sizeof(buf) - 1);
+        len = strlen(buf);
+        msgpack_pack_str(mp_pck, len);
+        msgpack_pack_str_body(mp_pck, buf, len);
+    }
+}
+
+static void cb_storage_metrics_collect(struct flb_config *ctx, void *data)
+{
+    msgpack_sbuffer mp_sbuf;
+    msgpack_packer mp_pck;
+
+    /* Prepare new outgoing buffer */
+    msgpack_sbuffer_init(&mp_sbuf);
+    msgpack_packer_init(&mp_pck, &mp_sbuf, msgpack_sbuffer_write);
+
+    /* Pack main map and append relevant data */
+    msgpack_pack_map(&mp_pck, 2);
+    metrics_append_general(&mp_pck, ctx, data);
+    metrics_append_input(&mp_pck, ctx, data);
+
+#ifdef FLB_HAVE_HTTP_SERVER
+    if (ctx->http_server == FLB_TRUE && ctx->storage_metrics == FLB_TRUE) {
+        flb_hs_push_storage_metrics(ctx->http_ctx, mp_sbuf.data, mp_sbuf.size);
+    }
+#endif
+    msgpack_sbuffer_destroy(&mp_sbuf);
+}
+
+struct flb_storage_metrics *flb_storage_metrics_create(struct flb_config *ctx)
+{
+    int ret;
+    struct flb_storage_metrics *sm;
+
+    sm = flb_malloc(sizeof(struct flb_storage_metrics));
+    if (!sm) {
+        flb_errno();
+        return NULL;
+    }
+
+    ret = flb_sched_timer_cb_create(ctx->sched, FLB_SCHED_TIMER_CB_PERM, 5000,
+                                    cb_storage_metrics_collect,
+                                    ctx->storage_metrics_ctx, NULL);
+    if (ret == -1) {
+        flb_error("[storage metrics] cannot create timer to collect metrics");
+        flb_free(sm);
+        return NULL;
+    }
+
+    return sm;
+}
+
+static int sort_chunk_cmp(const void *a_arg, const void *b_arg)
+{
+    char *p;
+    struct cio_chunk *chunk_a = *(struct cio_chunk **) a_arg;
+    struct cio_chunk *chunk_b = *(struct cio_chunk **) b_arg;
+    struct timespec tm_a;
+    struct timespec tm_b;
+
+    /* Scan Chunk A */
+    p = strchr(chunk_a->name, '-');
+    if (!p) {
+        return -1;
+    }
+    p++;
+
+    sscanf(p, "%lu.%lu.flb", &tm_a.tv_sec, &tm_a.tv_nsec);
+
+    /* Scan Chunk B */
+    p = strchr(chunk_b->name, '-');
+    if (!p) {
+        return -1;
+    }
+    p++;
+    sscanf(p, "%lu.%lu.flb", &tm_b.tv_sec, &tm_b.tv_nsec);
+
+    /* Compare */
+    if (tm_a.tv_sec != tm_b.tv_sec) {
+        if (tm_a.tv_sec > tm_b.tv_sec) {
+            return 1;
+        }
+        else {
+            return -1;
+        }
+    }
+    else {
+        if (tm_a.tv_nsec > tm_b.tv_nsec) {
+            return 1;
+        }
+        else if (tm_a.tv_nsec < tm_b.tv_nsec) {
+            return -1;
+        }
+    }
+
+    return 0;
+}
 
 static void print_storage_info(struct flb_config *ctx, struct cio_ctx *cio)
 {
+    char *type;
     char *sync;
     char *checksum;
     struct flb_input_instance *in;
 
-    flb_info("[storage] initializing...");
-
-    if (cio->root_path) {
-        flb_info("[storage] root path '%s'", cio->root_path);
+    if (cio->options.root_path) {
+        type = "memory+filesystem";
     }
     else {
-        flb_info("[storage] in-memory");
+        type = "memory-only";
     }
 
-    if (cio->flags & CIO_FULL_SYNC) {
+    if (cio->options.flags & CIO_FULL_SYNC) {
         sync = "full";
     }
     else {
         sync = "normal";
     }
 
-    if (cio->flags & CIO_CHECKSUM) {
+    if (cio->options.flags & CIO_CHECKSUM) {
         checksum = "enabled";
     }
     else {
         checksum = "disabled";
     }
 
-    flb_info("[storage] %s synchronization mode, checksum %s, max_chunks_up=%i",
-             sync, checksum, ctx->storage_max_chunks_up);
+    flb_info("[storage] version=%s, type=%s, sync=%s, checksum=%s, max_chunks_up=%i",
+             cio_version(), type, sync, checksum, ctx->storage_max_chunks_up);
 
     /* Storage input plugin */
     if (ctx->storage_input_plugin) {
@@ -62,58 +360,51 @@ static void print_storage_info(struct flb_config *ctx, struct cio_ctx *cio)
     }
 }
 
-static int log_cb(struct cio_ctx *ctx, int level, const char *file, int line,
-                  char *str)
+static void log_cb(void *ctx, int level, const char *file, int line,
+                   const char *str)
 {
-    if (level == CIO_ERROR) {
+    if (level == CIO_LOG_ERROR) {
         flb_error("[storage] %s", str);
     }
-    else if (level == CIO_WARN) {
+    else if (level == CIO_LOG_WARN) {
         flb_warn("[storage] %s", str);
     }
-    else if (level == CIO_INFO) {
+    else if (level == CIO_LOG_INFO) {
         flb_info("[storage] %s", str);
     }
-    else if (level == CIO_DEBUG) {
+    else if (level == CIO_LOG_DEBUG) {
         flb_debug("[storage] %s", str);
     }
-
-    return 0;
 }
 
 int flb_storage_input_create(struct cio_ctx *cio,
                              struct flb_input_instance *in)
 {
-    int type;
-    const char *tmp;
-    const char *name;
     struct flb_storage_input *si;
     struct cio_stream *stream;
 
     /* storage config: get stream type */
-    tmp = flb_input_get_property("storage.type", in);
-    if (tmp) {
-        if (strcasecmp(tmp, "filesystem") == 0) {
-            type = CIO_STORE_FS;
-        }
-        else if (strcasecmp(tmp, "memory") == 0) {
-            type = CIO_STORE_MEM;
-        }
-        else {
-            flb_error("[storage] invalid type '%s' on instance %s",
-                      tmp, flb_input_name(in));;
-            return -1;
-        }
-    }
-    else {
-        type = CIO_STORE_MEM;
+    if (in->storage_type == -1) {
+        in->storage_type = CIO_STORE_MEM;
     }
 
-    if (type == CIO_STORE_FS && cio->root_path == NULL) {
+    if (in->storage_type == CIO_STORE_FS && cio->options.root_path == NULL) {
         flb_error("[storage] instance '%s' requested filesystem storage "
                   "but no filesystem path was defined.",
                   flb_input_name(in));
         return -1;
+    }
+
+    /* Check for duplicates */
+    stream = cio_stream_get(cio, in->name);
+    if (!stream) {
+        /* create stream for input instance */
+        stream = cio_stream_create(cio, in->name, in->storage_type);
+        if (!stream) {
+            flb_error("[storage] cannot create stream for instance %s",
+                      in->name);
+            return -1;
+        }
     }
 
     /* allocate storage context for the input instance */
@@ -123,21 +414,9 @@ int flb_storage_input_create(struct cio_ctx *cio,
         return -1;
     }
 
-    /* get stream name */
-    name = flb_input_name(in);
-
-    /* create stream for input instance */
-    stream = cio_stream_create(cio, name, type);
-    if (!stream) {
-        flb_error("[storage] cannot create stream for instance %s",
-                  name);
-        flb_free(si);
-        return -1;
-    }
-
     si->stream = stream;
     si->cio = cio;
-    si->type = type;
+    si->type = in->storage_type;
     in->storage = si;
 
     return 0;
@@ -149,7 +428,7 @@ void flb_storage_input_destroy(struct flb_input_instance *in)
     struct mk_list *head;
     struct flb_input_chunk *ic;
 
-    /* Save current temporal data and destroy chunk references */
+    /* Save current temporary data and destroy chunk references */
     mk_list_foreach_safe(head, tmp, &in->chunks) {
         ic = mk_list_entry(head, struct flb_input_chunk, _head);
         flb_input_chunk_destroy(ic, FLB_FALSE);
@@ -181,24 +460,13 @@ static int storage_contexts_create(struct flb_config *config)
     return c;
 }
 
-static void storage_contexts_destroy(struct flb_config *config)
-{
-    struct mk_list *head;
-    struct flb_input_instance *in;
-
-    /* Iterate each input instance and destroy the context */
-    mk_list_foreach(head, &config->inputs) {
-        in = mk_list_entry(head, struct flb_input_instance, _head);
-        flb_storage_input_destroy(in);
-    }
-}
-
 int flb_storage_create(struct flb_config *ctx)
 {
     int ret;
     int flags;
     struct flb_input_instance *in = NULL;
     struct cio_ctx *cio;
+    struct cio_options opts = {0};
 
     /* always use read/write mode */
     flags = CIO_OPEN;
@@ -222,8 +490,14 @@ int flb_storage_create(struct flb_config *ctx)
         flags |= CIO_CHECKSUM;
     }
 
+    /* chunkio options */
+    opts.root_path = ctx->storage_path;
+    opts.flags = flags;
+    opts.log_cb = log_cb;
+    opts.log_level = CIO_LOG_INFO;
+
     /* Create chunkio context */
-    cio = cio_create(ctx->storage_path, log_cb, CIO_DEBUG, flags);
+    cio = cio_create(&opts);
     if (!cio) {
         flb_error("[storage] error initializing storage engine");
         return -1;
@@ -237,13 +511,16 @@ int flb_storage_create(struct flb_config *ctx)
     cio_set_max_chunks_up(ctx->cio, ctx->storage_max_chunks_up);
 
     /* Load content from the file system if any */
-    ret = cio_load(ctx->cio);
+    ret = cio_load(ctx->cio, NULL);
     if (ret == -1) {
         flb_error("[storage] error scanning root path content: %s",
                   ctx->storage_path);
         cio_destroy(ctx->cio);
         return -1;
     }
+
+    /* Sort chunks */
+    cio_qsort(ctx->cio, sort_chunk_cmp);
 
     /*
      * If we have a filesystem storage path, create an instance of the
@@ -289,12 +566,11 @@ void flb_storage_destroy(struct flb_config *ctx)
         return;
     }
 
-    cio_destroy(cio);
-    if (ctx->storage_bl_mem_limit) {
-        flb_free(ctx->storage_bl_mem_limit);
+    if (ctx->storage_metrics == FLB_TRUE &&
+        ctx->storage_metrics_ctx != NULL) {
+        flb_free(ctx->storage_metrics_ctx);
     }
 
-    /* Delete references from input instances */
-    storage_contexts_destroy(ctx);
+    cio_destroy(cio);
     ctx->cio = NULL;
 }

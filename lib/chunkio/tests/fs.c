@@ -17,8 +17,13 @@
  *  limitations under the License.
  */
 
+#ifndef _WIN32
 #include <sys/mman.h>
 #include <arpa/inet.h>
+#endif
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 
 #include <chunkio/chunkio.h>
 #include <chunkio/cio_log.h>
@@ -27,11 +32,13 @@
 #include <chunkio/cio_meta.h>
 #include <chunkio/cio_stream.h>
 #include <chunkio/cio_utils.h>
+#include <chunkio/cio_error.h>
 
 #include "cio_tests_internal.h"
 
 #define CIO_ENV           "/tmp/cio-fs-test/"
 #define CIO_FILE_400KB    CIO_TESTS_DATA_PATH "/data/400kb.txt"
+
 
 /* Logging callback, once called it just turn on the log_check flag */
 static int log_cb(struct cio_ctx *ctx, int level, const char *file, int line,
@@ -49,6 +56,7 @@ static void test_fs_write()
     int i;
     int ret;
     int len;
+    int err;
     int n_files = 100;
     int flags;
     char *in_data;
@@ -58,21 +66,29 @@ static void test_fs_write()
     struct cio_stream *stream;
     struct cio_chunk *chunk;
     struct cio_chunk **carr;
+    struct cio_options cio_opts;
 
     /* Dummy break line for clarity on acutest output */
     printf("\n");
 
     flags = CIO_CHECKSUM;
 
+    memset(&cio_opts, 0, sizeof(cio_opts));
+
+    cio_opts.root_path = CIO_ENV;
+    cio_opts.log_cb = log_cb;
+    cio_opts.log_level = CIO_LOG_INFO;
+    cio_opts.flags = flags;
+
     /* cleanup environment */
     cio_utils_recursive_delete(CIO_ENV);
 
     /* Create main context */
-    ctx = cio_create(CIO_ENV, log_cb, CIO_INFO, flags);
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx != NULL);
 
     /* Try to create a file with an invalid stream */
-    chunk = cio_chunk_open(ctx, NULL, "invalid", 0, 0);
+    chunk = cio_chunk_open(ctx, NULL, "invalid", 0, 0, &err);
     TEST_CHECK(chunk == NULL);
 
     /* Check invalid stream */
@@ -111,7 +127,7 @@ static void test_fs_write()
 
     for (i = 0; i < n_files; i++) {
         len = snprintf(tmp, sizeof(tmp), "api-test-%04i.txt", i);
-        carr[i] = cio_chunk_open(ctx, stream, tmp, CIO_OPEN, 1000000);
+        carr[i] = cio_chunk_open(ctx, stream, tmp, CIO_OPEN, 1000000, &err);
 
         if (carr[i] == NULL) {
             continue;
@@ -144,8 +160,15 @@ static void test_fs_write()
     free(in_data);
     cio_destroy(ctx);
 
+    memset(&cio_opts, 0, sizeof(cio_opts));
+
+    cio_opts.root_path = CIO_ENV;
+    cio_opts.log_cb = log_cb;
+    cio_opts.log_level = CIO_LOG_INFO;
+    cio_opts.flags = flags;
+
     /* Create new context using the data generated above */
-    ctx = cio_create(CIO_ENV, log_cb, CIO_INFO, flags);
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx != NULL);
     cio_scan_dump(ctx);
     cio_destroy(ctx);
@@ -158,6 +181,7 @@ static void test_fs_write()
 static void test_fs_checksum()
 {
     int ret;
+    int err;
     int flags;
     char *in_data;
     char *f_hash;
@@ -166,6 +190,7 @@ static void test_fs_checksum()
     struct cio_ctx *ctx;
     struct cio_stream *stream;
     struct cio_chunk *chunk;
+    struct cio_options cio_opts;
 
     /*
      * crc32 checksums
@@ -196,7 +221,14 @@ static void test_fs_checksum()
     /* cleanup environment */
     cio_utils_recursive_delete(CIO_ENV);
 
-    ctx = cio_create(CIO_ENV, log_cb, CIO_INFO, flags);
+    memset(&cio_opts, 0, sizeof(cio_opts));
+
+    cio_opts.root_path = CIO_ENV;
+    cio_opts.log_cb = log_cb;
+    cio_opts.log_level = CIO_LOG_INFO;
+    cio_opts.flags = flags;
+
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx != NULL);
 
     stream = cio_stream_create(ctx, "test-crc32", CIO_STORE_FS);
@@ -216,7 +248,7 @@ static void test_fs_checksum()
      *  - sync
      *  - validate crc32_test1
      */
-    chunk = cio_chunk_open(ctx, stream, "test1.out", CIO_OPEN, 10);
+    chunk = cio_chunk_open(ctx, stream, "test1.out", CIO_OPEN, 10, &err);
     TEST_CHECK(chunk != NULL);
 
     /* Check default crc32() for an empty file after sync */
@@ -262,14 +294,18 @@ static void test_fs_checksum()
 static void test_fs_up_down()
 {
     int ret;
+    int err;
     int flags;
     char *in_data;
     char *f_hash;
     size_t in_size;
     uint32_t val;
+    char path[1024];
+    struct stat st;
     struct cio_ctx *ctx;
     struct cio_stream *stream;
     struct cio_chunk *chunk;
+    struct cio_options cio_opts;
 
     /*
      * crc32 checksums
@@ -300,7 +336,14 @@ static void test_fs_up_down()
     /* cleanup environment */
     cio_utils_recursive_delete(CIO_ENV);
 
-    ctx = cio_create(CIO_ENV, log_cb, CIO_INFO, flags);
+    memset(&cio_opts, 0, sizeof(cio_opts));
+
+    cio_opts.root_path = CIO_ENV;
+    cio_opts.log_cb = log_cb;
+    cio_opts.log_level = CIO_LOG_INFO;
+    cio_opts.flags = flags;
+
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx != NULL);
 
     stream = cio_stream_create(ctx, "test-crc32", CIO_STORE_FS);
@@ -320,12 +363,13 @@ static void test_fs_up_down()
      *  - sync
      *  - validate crc32_test1
      */
-    chunk = cio_chunk_open(ctx, stream, "test1.out", CIO_OPEN, 10);
+    chunk = cio_chunk_open(ctx, stream, "test1.out", CIO_OPEN, 10, &err);
     TEST_CHECK(chunk != NULL);
 
     /* file down/up */
     TEST_CHECK(cio_chunk_is_up(chunk) == CIO_TRUE);
     ret = cio_chunk_down(chunk);
+
     TEST_CHECK(ret == 0);
     TEST_CHECK(cio_chunk_is_up(chunk) == CIO_FALSE);
     ret = cio_chunk_up(chunk);
@@ -354,7 +398,18 @@ static void test_fs_up_down()
      * sha1 context so it skip old data to perform the verification.
      */
     cio_chunk_write(chunk, in_data, in_size);
+
     cio_chunk_sync(chunk);
+
+    /*
+     * Bug https://github.com/fluent/fluent-bit/pull/3054#issuecomment-778831815
+     *
+     * the fs_size cache value is not being updated after a sync, let's validate.
+     */
+    snprintf(path, sizeof(path) - 1, "%s%s", CIO_ENV, "test-crc32/test1.out");
+    ret = stat(path, &st);
+    TEST_CHECK(ret == 0);
+    TEST_CHECK(st.st_size == cio_chunk_get_real_size(chunk));
 
     /* file down/up */
     TEST_CHECK(cio_chunk_is_up(chunk) == CIO_TRUE);
@@ -377,9 +432,376 @@ static void test_fs_up_down()
     free(in_data);
 }
 
+/* ref: https://github.com/edsiper/chunkio/pull/51 */
+static void test_issue_51()
+{
+    int fd;
+    int err;
+    struct cio_ctx *ctx;
+    struct cio_stream *stream;
+    struct cio_options cio_opts;
+
+    /* Create a temporal storage */
+    memset(&cio_opts, 0, sizeof(cio_opts));
+
+    cio_opts.root_path = "tmp";
+    cio_opts.log_cb = log_cb;
+    cio_opts.log_level = CIO_LOG_DEBUG;
+    cio_opts.flags = 0;
+
+    ctx = cio_create(&cio_opts);
+    stream = cio_stream_create(ctx, "test", CIO_STORE_FS);
+    cio_chunk_open(ctx, stream, "c", CIO_OPEN, 1000, &err);
+    cio_destroy(ctx);
+
+    /* Corrupt the file */
+    fd = open("tmp/test/c", O_WRONLY);
+    TEST_CHECK(fd != -1);
+    if (fd == -1) {
+        perror("open");
+        exit(1);
+    }
+
+#ifdef _WIN32
+    _chsize(fd, 1);
+#else
+    ftruncate(fd, 1);
+#endif
+
+    close(fd);
+
+    /* Re-read the content */
+    ctx = cio_create(&cio_opts);
+
+    /* Upon scanning an existing stream, if not fixed, the program crashes */
+    stream = cio_stream_create(ctx, "test", CIO_STORE_FS);
+    cio_chunk_open(ctx, stream, "c", CIO_OPEN, 1000, &err);
+    cio_destroy(ctx);
+}
+
+/* ref: https://github.com/fluent/fluent-bit/2025 */
+static void test_issue_flb_2025()
+{
+    int i;
+    int ret;
+    int err;
+    int len;
+    char line[] = "this is a test line\n";
+    struct cio_ctx *ctx;
+    struct cio_chunk *chunk;
+    struct cio_stream *stream;
+    struct cio_options cio_opts;
+
+    cio_utils_recursive_delete("tmp");
+
+    /* Create a temporal storage */
+    memset(&cio_opts, 0, sizeof(cio_opts));
+
+    cio_opts.root_path = "tmp";
+    cio_opts.log_cb = log_cb;
+    cio_opts.log_level = CIO_LOG_DEBUG;
+    cio_opts.flags = CIO_CHECKSUM;
+
+    ctx = cio_create(&cio_opts);
+    stream = cio_stream_create(ctx, "test", CIO_STORE_FS);
+    chunk = cio_chunk_open(ctx, stream, "c", CIO_OPEN, 1000, &err);
+    TEST_CHECK(chunk != NULL);
+    if (!chunk) {
+        printf("cannot open chunk\n");
+        exit(1);
+    }
+
+    len = strlen(line);
+    for (i = 0; i < 1000; i++) {
+        ret = cio_chunk_write(chunk, line, len);
+        TEST_CHECK(ret == CIO_OK);
+
+        ret = cio_chunk_down(chunk);
+        TEST_CHECK(ret == CIO_OK);
+
+        ret = cio_chunk_up(chunk);
+        TEST_CHECK(ret == CIO_OK);
+    }
+
+    cio_destroy(ctx);
+}
+
+void test_fs_size_chunks_up()
+{
+    int i;
+    int ret;
+    int len;
+    int err;
+    int flags;
+    char line[] = "this is a test line\n";
+    char name[32];
+    size_t expected;
+    struct cio_ctx *ctx;
+    struct cio_chunk *chunk;
+    struct cio_chunk *chunk_tmp;
+    struct cio_stream *stream;
+    struct cio_options cio_opts;
+
+    /* cleanup environment */
+    cio_utils_recursive_delete(CIO_ENV);
+
+    flags = CIO_CHECKSUM;
+
+    memset(&cio_opts, 0, sizeof(cio_opts));
+
+    cio_opts.root_path = CIO_ENV;
+    cio_opts.log_cb = log_cb;
+    cio_opts.log_level = CIO_LOG_INFO;
+    cio_opts.flags = flags;
+
+    ctx = cio_create(&cio_opts);
+    TEST_CHECK(ctx != NULL);
+
+    /* Set default number of chunks up */
+    cio_set_max_chunks_up(ctx, 50);
+
+    stream = cio_stream_create(ctx, "test_size_chunks_up", CIO_STORE_FS);
+    TEST_CHECK(stream != NULL);
+
+    len = strlen(line);
+    for (i = 0; i < 100; i++) {
+        /* Create the chunk */
+        snprintf(name, sizeof(name) - 1, "test-%i", i);
+
+        chunk = cio_chunk_open(ctx, stream, name, CIO_OPEN, 1000, &err);
+        TEST_CHECK(chunk != NULL);
+        if (!chunk) {
+            exit(1);
+        }
+
+        if (i < 50) {
+            /* First 50 chunks (0-49) will be in an 'up' state */
+            ret = cio_chunk_is_up(chunk);
+            TEST_CHECK(ret == CIO_TRUE);
+            if (ret == CIO_FALSE) {
+                exit(1);
+            }
+            ret = cio_chunk_write(chunk, line, len);
+            TEST_CHECK(ret == CIO_OK);
+
+            /* Check this chunk is in the 'chunks_up' list */
+            chunk_tmp = mk_list_entry_last(&stream->chunks_up,
+                                           struct cio_chunk,
+                                           _state_head);
+            TEST_CHECK(chunk_tmp == chunk);
+
+            /* Put the chunk down and now recheck 'chunks_down' list */
+            ret = cio_chunk_down(chunk);
+            TEST_CHECK(ret == CIO_OK);
+
+            /* Down list */
+            chunk_tmp = mk_list_entry_last(&stream->chunks_down,
+                                           struct cio_chunk,
+                                           _state_head);
+            TEST_CHECK(chunk_tmp == chunk);
+
+            /* Put the chunk UP again */
+            ret = cio_chunk_up(chunk);
+            TEST_CHECK(ret == CIO_OK);
+
+            /* Check this chunk is in the 'chunks_up' list */
+            chunk_tmp = mk_list_entry_last(&stream->chunks_up,
+                                           struct cio_chunk,
+                                           _state_head);
+            TEST_CHECK(chunk_tmp == chunk);
+        }
+        else {
+            /*
+             * Remaining created chunks are in a down state, after creation
+             * this chunks must be linked in the struct cio_stream->chunks_down
+             * list.
+             */
+            chunk_tmp = mk_list_entry_last(&stream->chunks_down,
+                                           struct cio_chunk,
+                                           _state_head);
+            TEST_CHECK(chunk_tmp == chunk);
+        }
+    }
+
+    /* 50 chunks are up, each chunk contains 'len' bytes */
+    expected = 50 * len;
+    TEST_CHECK(cio_stream_size_chunks_up(stream) == expected);
+
+    /* Cleanup */
+    cio_destroy(ctx);
+}
+
+void test_issue_write_at()
+{
+    int ret;
+    int len;
+    int err;
+    char line[] = "this is a test line\n";
+    struct cio_ctx *ctx;
+    struct cio_chunk *chunk;
+    struct cio_stream *stream;
+    struct cio_options cio_opts;
+
+    /* cleanup environment */
+    cio_utils_recursive_delete(CIO_ENV);
+
+    /* create Chunk I/O context */
+    memset(&cio_opts, 0, sizeof(cio_opts));
+
+    cio_opts.root_path = CIO_ENV;
+    cio_opts.log_cb = log_cb;
+    cio_opts.log_level = CIO_LOG_INFO;
+    cio_opts.flags = CIO_CHECKSUM;
+
+    ctx = cio_create(&cio_opts);
+    TEST_CHECK(ctx != NULL);
+
+    /* Set default number of chunks up */
+    cio_set_max_chunks_up(ctx, 50);
+
+    /* create stream */
+    stream = cio_stream_create(ctx, "test_write_at", CIO_STORE_FS);
+    TEST_CHECK(stream != NULL);
+
+    /* create chunk */
+    chunk = cio_chunk_open(ctx, stream, "test", CIO_OPEN, 1000, &err);
+    TEST_CHECK(chunk != NULL);
+    if (!chunk) {
+        exit(1);
+    }
+
+    len = strlen(line);
+
+    /* Write 3 lines */
+    ret = cio_chunk_write(chunk, line, len);
+    TEST_CHECK(ret == CIO_OK);
+
+    ret = cio_chunk_write(chunk, line, len);
+    TEST_CHECK(ret == CIO_OK);
+
+    ret = cio_chunk_write(chunk, line, len);
+    TEST_CHECK(ret == CIO_OK);
+
+    /*
+     * Write some content after the second line: this is the issue, when writing
+     * to a position lowest than the last offset the checksum is not updated, for
+     * hence after putting it down and up again, the checksym validation fails
+     * and we get in the wrong state.
+     */
+    ret = cio_chunk_write_at(chunk, len * 2, "test\n", 5);
+    TEST_CHECK(ret == CIO_OK);
+
+    /* Put the chunk down and up */
+    ret = cio_chunk_down(chunk);
+    TEST_CHECK(ret == CIO_OK);
+
+    /* Trigger the 'format check failed' error */
+    ret = cio_chunk_up(chunk);
+    TEST_CHECK(ret == CIO_OK);
+
+    /*
+     * Corrupt the CRC manually, alter the current CRC and write a byte
+     * to the chunk to get the checksum corruption. Here we expect two
+     * things:
+     *
+     * - when trying to put the chunk get CIO_CORRUPTED
+     * - check the error number, it must be CIO_ERR_BAD_CHECKSUM
+     * - memory map must be null and file descriptor must be in a closed state
+     */
+    struct cio_file *cf = (struct cio_file *) chunk->backend;
+    cf->crc_cur = 10;
+    cio_chunk_write(chunk, "\0", 1);
+
+    ret = cio_chunk_down(chunk);
+    TEST_CHECK(ret == CIO_OK);
+
+    ret = cio_chunk_up(chunk);
+    TEST_CHECK(ret == CIO_CORRUPTED);
+    TEST_CHECK(cio_error_get(chunk) == CIO_ERR_BAD_CHECKSUM);
+
+    cf = (struct cio_file *) chunk->backend;
+    TEST_CHECK(cf->map == NULL);
+    TEST_CHECK(cf->fd <= 0);
+}
+
+
+void test_fs_up_down_up_append()
+{
+    int ret;
+    int err;
+    struct cio_ctx *ctx;
+    struct cio_chunk *chunk;
+    struct cio_stream *stream;
+
+    void *out_buf;
+    size_t out_size;
+
+    cio_utils_recursive_delete(CIO_ENV);
+
+    /* Create a temporal storage */
+    ctx = cio_create(CIO_ENV, log_cb, CIO_LOG_DEBUG, CIO_CHECKSUM);
+    stream = cio_stream_create(ctx, "cio", CIO_STORE_FS);
+    chunk = cio_chunk_open(ctx, stream, "c", CIO_OPEN, 1000, &err);
+    TEST_CHECK(chunk != NULL);
+    if (!chunk) {
+        printf("cannot open chunk\n");
+        exit(1);
+    }
+
+    ret = cio_chunk_get_content_copy(chunk, &out_buf, &out_size);
+    TEST_CHECK(ret == CIO_OK);
+    TEST_CHECK(memcmp(out_buf, "", 1) == 0);
+    TEST_CHECK(out_size == 0);
+    free(out_buf);
+
+    ret = cio_chunk_write(chunk, "line 1\n", 7);
+    TEST_CHECK(ret == CIO_OK);
+
+    ret = cio_chunk_get_content_copy(chunk, &out_buf, &out_size);
+    TEST_CHECK(ret == CIO_OK);
+    TEST_CHECK(memcmp(out_buf, "line 1\n", 7+1) == 0);
+    TEST_CHECK(out_size == 7);
+    free(out_buf);
+
+    ret = cio_chunk_down(chunk);
+    TEST_CHECK(ret == CIO_OK);
+
+    ret = cio_chunk_up(chunk);
+    TEST_CHECK(ret == CIO_OK);
+
+    ret = cio_chunk_get_content_copy(chunk, &out_buf, &out_size);
+    TEST_CHECK(ret == CIO_OK);
+    TEST_CHECK(memcmp(out_buf, "line 1\n", 7+1) == 0);
+    TEST_CHECK(out_size == 7);
+    free(out_buf);
+
+    /* append */
+    ret = cio_chunk_write(chunk, "line 2\n", 7);
+    TEST_CHECK(ret == CIO_OK);
+
+    ret = cio_chunk_down(chunk);
+    TEST_CHECK(ret == CIO_OK);
+
+    ret = cio_chunk_up(chunk);
+    TEST_CHECK(ret == CIO_OK);
+
+    ret = cio_chunk_get_content_copy(chunk, &out_buf, &out_size);
+    TEST_CHECK(ret == CIO_OK);
+    TEST_CHECK(memcmp(out_buf, "line 1\nline 2\n", 7*2+1) == 0);
+    TEST_CHECK(out_size == 7*2);
+    free(out_buf);
+
+    cio_destroy(ctx);
+}
+
 TEST_LIST = {
     {"fs_write",   test_fs_write},
     {"fs_checksum",  test_fs_checksum},
     {"fs_up_down", test_fs_up_down},
+    {"fs_size_chunks_up", test_fs_size_chunks_up},
+    {"issue_51",   test_issue_51},
+    {"issue_flb_2025", test_issue_flb_2025},
+    {"issue_write_at", test_issue_write_at},
+    {"fs_up_down_up_append", test_fs_up_down_up_append},
     { 0 }
 };

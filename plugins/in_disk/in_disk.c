@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -20,6 +19,7 @@
 
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_input.h>
+#include <fluent-bit/flb_input_plugin.h>
 #include <fluent-bit/flb_config.h>
 #include <fluent-bit/flb_error.h>
 #include <fluent-bit/flb_str.h>
@@ -42,7 +42,7 @@ static char *shift_line(const char *line, char separator, int *idx,
     char pack_mode = FLB_FALSE;
     int  idx_buf = 0;
 
-    while(1) {
+    while (1) {
         if (line[*idx] == '\0') {
             /* end of line */
             return NULL;
@@ -78,7 +78,7 @@ static int update_disk_stats(struct flb_in_disk_config *ctx)
 
     fp = fopen("/proc/diskstats", "r");
     if (fp == NULL) {
-        perror("fopen");
+        flb_errno();
         return -1;
     }
 
@@ -139,11 +139,11 @@ static int in_disk_collect(struct flb_input_instance *i_ins,
 
     update_disk_stats(ctx);
 
-    if ( ctx->first_snapshot == FLB_TRUE ){
+    if (ctx->first_snapshot == FLB_TRUE) {
         ctx->first_snapshot = FLB_FALSE;    /* assign first_snapshot with FLB_FALSE */
     }
     else {
-        for (i=0; i<entry; i++) {
+        for (i = 0; i < entry; i++) {
             if (ctx->read_total[i] >= ctx->prev_read_total[i]) {
                 read_total += ctx->read_total[i] - ctx->prev_read_total[i];
             }
@@ -211,42 +211,25 @@ static int get_diskstats_entries(void)
 }
 
 static int configure(struct flb_in_disk_config *disk_config,
-                               struct flb_input_instance *in)
+                     struct flb_input_instance *in)
 {
     (void) *in;
-    const char *pval = NULL;
     int entry = 0;
     int i;
+    int ret;
+
+    /* Load the config map */
+    ret = flb_input_config_map_set(in, (void *)disk_config);
+    if (ret == -1) {
+        flb_plg_error(in, "unable to load configuration.");
+        return -1;
+    }
 
     /* interval settings */
-    pval = flb_input_get_property("interval_sec", in);
-    if (pval != NULL && atoi(pval) >= 0) {
-        disk_config->interval_sec = atoi(pval);
-    }
-    else {
-        disk_config->interval_sec = DEFAULT_INTERVAL_SEC;
-    }
-
-    pval = flb_input_get_property("interval_nsec", in);
-    if (pval != NULL && atoi(pval) >= 0) {
-        disk_config->interval_nsec = atoi(pval);
-    }
-    else {
-        disk_config->interval_nsec = DEFAULT_INTERVAL_NSEC;
-    }
-
     if (disk_config->interval_sec <= 0 && disk_config->interval_nsec <= 0) {
         /* Illegal settings. Override them. */
-        disk_config->interval_sec = DEFAULT_INTERVAL_SEC;
-        disk_config->interval_nsec = DEFAULT_INTERVAL_NSEC;
-    }
-
-    pval = flb_input_get_property("dev_name", in);
-    if (pval != NULL) {
-        disk_config->dev_name = flb_strdup(pval);
-    }
-    else {
-        disk_config->dev_name = NULL;
+        disk_config->interval_sec = atoi(DEFAULT_INTERVAL_SEC);
+        disk_config->interval_nsec = atoi(DEFAULT_INTERVAL_NSEC);
     }
 
     entry = get_diskstats_entries();
@@ -260,6 +243,14 @@ static int configure(struct flb_in_disk_config *disk_config,
     disk_config->prev_read_total = (uint64_t*)flb_malloc(sizeof(uint64_t)*entry);
     disk_config->prev_write_total = (uint64_t*)flb_malloc(sizeof(uint64_t)*entry);
     disk_config->entry = entry;
+
+    if ( disk_config->read_total       == NULL ||
+         disk_config->write_total      == NULL ||
+         disk_config->prev_read_total  == NULL ||
+         disk_config->prev_write_total == NULL) {
+        flb_plg_error(in, "could not allocate memory");
+        return -1;
+    }
 
     /* initialize */
     for (i=0; i<entry; i++) {
@@ -283,7 +274,7 @@ static int in_disk_init(struct flb_input_instance *in,
     int ret = -1;
 
     /* Allocate space for the configuration */
-    disk_config = flb_malloc(sizeof(struct flb_in_disk_config));
+    disk_config = flb_calloc(1, sizeof(struct flb_in_disk_config));
     if (disk_config == NULL) {
         return -1;
     }
@@ -305,7 +296,7 @@ static int in_disk_init(struct flb_input_instance *in,
                                        disk_config->interval_sec,
                                        disk_config->interval_nsec, config);
     if (ret < 0) {
-        flb_error("could not set collector for disk input plugin");
+        flb_plg_error(in, "could not set collector for disk input plugin");
         goto init_error;
     }
 
@@ -329,11 +320,30 @@ static int in_disk_exit(void *data, struct flb_config *config)
     flb_free(disk_config->write_total);
     flb_free(disk_config->prev_read_total);
     flb_free(disk_config->prev_write_total);
-    flb_free(disk_config->dev_name);
     flb_free(disk_config);
     return 0;
 }
 
+/* Configuration properties map */
+static struct flb_config_map config_map[] = {
+    {
+      FLB_CONFIG_MAP_INT, "interval_sec", DEFAULT_INTERVAL_SEC,
+      0, FLB_TRUE, offsetof(struct flb_in_disk_config, interval_sec),
+      "Set the collector interval"
+    },
+    {
+      FLB_CONFIG_MAP_INT, "interval_nsec", DEFAULT_INTERVAL_NSEC,
+      0, FLB_TRUE, offsetof(struct flb_in_disk_config, interval_nsec),
+      "Set the collector interval (nanoseconds)"
+    },
+    {
+      FLB_CONFIG_MAP_STR, "dev_name", (char *)NULL,
+      0, FLB_TRUE, offsetof(struct flb_in_disk_config, dev_name),
+      "Set the device name"
+    },
+    /* EOF */
+    {0}
+};
 
 struct flb_input_plugin in_disk_plugin = {
     .name         = "disk",
@@ -342,5 +352,6 @@ struct flb_input_plugin in_disk_plugin = {
     .cb_pre_run   = NULL,
     .cb_collect   = in_disk_collect,
     .cb_flush_buf = NULL,
-    .cb_exit      = in_disk_exit
+    .cb_exit      = in_disk_exit,
+    .config_map   = config_map
 };

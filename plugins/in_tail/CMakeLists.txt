@@ -3,8 +3,14 @@ set(src
   tail_dockermode.c
   tail_scan.c
   tail_config.c
-  tail_fs.c
+  tail_fs_stat.c
   tail.c)
+
+if(FLB_HAVE_INOTIFY)
+set(src
+    ${src}
+    tail_fs_inotify.c)
+endif()
 
 if(FLB_SQLDB)
 set(src
@@ -20,6 +26,11 @@ if(FLB_PARSER)
 endif()
 
 if(MSVC)
+  set(src
+    ${src}
+    win32/stat.c
+    win32/io.c
+    )
   FLB_PLUGIN(in_tail "${src}" "Shlwapi")
 else()
   FLB_PLUGIN(in_tail "${src}" "")

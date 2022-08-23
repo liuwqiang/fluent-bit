@@ -30,16 +30,29 @@
 #include <monkey/mk_fifo.h>
 #include <monkey/mk_http_thread.h>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#else
 #include <sys/socket.h>
 #include <netinet/in.h>
+#endif
+
+#ifndef _WIN32
 #include <sys/time.h>
 #include <sys/resource.h>
+#endif
+
+pthread_key_t mk_server_fifo_key;
+
+static int mk_server_lib_notify_event_loop_break(struct mk_sched_worker *sched);
 
 /* Return the number of clients that can be attended  */
 unsigned int mk_server_capacity(struct mk_server *server)
 {
     int ret;
     int cur;
+
+#ifndef _WIN32
     struct rlimit lim;
 
     /* Limit by system */
@@ -61,6 +74,17 @@ unsigned int mk_server_capacity(struct mk_server *server)
     else if (server->fd_limit > 0) {
         cur = server->fd_limit;
     }
+
+#else
+    ret = 0;
+    cur = INT_MAX; 
+
+    /* This is not the right way to plug this, according to raymond chen the only limit
+     * to fd count is free memory in their winsock provider and there are no other limits
+     * that I know of but I should still look for a more elegant solution. (even if it
+     * was just ignoring the server_capacity limit in scheduler.c: _next_target)
+    */
+#endif
 
     return cur;
 }
@@ -294,12 +318,16 @@ static int mk_server_fifo_worker_setup(struct mk_event_loop *evl)
  */
 void mk_server_loop_balancer(struct mk_server *server)
 {
+    size_t bytes;
+    uint64_t val;
+    int operation_flag;
     struct mk_list *head;
     struct mk_list *listeners;
     struct mk_server_listen *listener;
     struct mk_event *event;
     struct mk_event_loop *evl;
     struct mk_sched_worker *sched;
+    struct mk_event management_event;
 
     /* Init the listeners */
     listeners = mk_server_listen_init(server);
@@ -323,10 +351,42 @@ void mk_server_loop_balancer(struct mk_server *server)
                      listener);
     }
 
-    while (1) {
+    memset(&management_event, 0, sizeof(struct mk_event));
+
+    mk_event_add(evl,
+                 server->lib_ch_manager[0],
+                 MK_EVENT_NOTIFICATION,
+                 MK_EVENT_READ,
+                 &management_event);
+
+    operation_flag = MK_TRUE;
+    while (operation_flag) {
         mk_event_wait(evl);
         mk_event_foreach(event, evl) {
             if (event->mask & MK_EVENT_READ) {
+                /* This signal is sent by mk_stop and both this and
+                 * mk_lib_worker are expecting it.
+                 */
+                if (server->lib_ch_manager[0] == event->fd) {
+#ifdef _WIN32
+        bytes = recv(event->fd, &val, sizeof(uint64_t), MSG_WAITALL);
+#else
+        bytes = read(event->fd, &val, sizeof(uint64_t));
+#endif
+
+                    if (bytes <= 0) {
+                        return;
+                    }
+
+                    if (val == MK_SERVER_SIGNAL_STOP) {
+                        operation_flag = MK_FALSE;
+
+                        break;
+                    }
+
+                    continue;
+                }
+
                 /*
                  * Accept connection: determinate which thread may work on this
                  * new connection.
@@ -334,6 +394,9 @@ void mk_server_loop_balancer(struct mk_server *server)
                 sched = mk_sched_next_target(server);
                 if (sched != NULL) {
                     mk_server_listen_handler(sched, event, server);
+
+                    mk_server_lib_notify_event_loop_break(sched);
+
 #ifdef MK_HAVE_TRACE
                     int i;
                     struct mk_sched_ctx *ctx = server->sched_ctx;
@@ -394,7 +457,15 @@ void mk_server_worker_loop(struct mk_server *server)
         if ((event->mask & MK_EVENT_READ) &&
             event->type == MK_EVENT_NOTIFICATION) {
             if (event->fd == sched->signal_channel_r) {
+        /* When using libevent _mk_event_channel_create creates a unix socket
+         * instead of a pipe and windows doesn't us calling read / write on a
+         * socket instead of recv / send
+         */
+#ifdef _WIN32
+                ret = recv(event->fd, &val, sizeof(val), MSG_WAITALL);
+#else
                 ret = read(event->fd, &val, sizeof(val));
+#endif
                 if (ret < 0) {
                     mk_libc_error("read");
                     continue;
@@ -488,7 +559,11 @@ void mk_server_worker_loop(struct mk_server *server)
                 event->handler(event);
             }
             else if (event->type == MK_EVENT_NOTIFICATION) {
+#ifdef _WIN32
+                ret = recv(event->fd, &val, sizeof(val), MSG_WAITALL);
+#else
                 ret = read(event->fd, &val, sizeof(val));
+#endif
                 if (ret < 0) {
                     mk_libc_error("read");
                     continue;
@@ -501,13 +576,20 @@ void mk_server_worker_loop(struct mk_server *server)
                     }
                     else if (val == MK_SCHED_SIGNAL_FREE_ALL) {
                         if (timeout_fd > 0) {
-                            close(timeout_fd);
+                            mk_event_timeout_destroy(evl, server_timeout);
                         }
                         mk_mem_free(MK_TLS_GET(mk_tls_server_timeout));
                         mk_server_listen_exit(sched->listeners);
                         mk_event_loop_destroy(evl);
                         mk_sched_worker_free(server);
                         return;
+                    }
+                    else if (val == MK_SCHED_SIGNAL_EVENT_LOOP_BREAK) {
+                        /* NOTE: This is just a notification that's sent to break out
+                         *       of the libevent loop in windows after accepting a new
+                         *       client
+                        */
+                        MK_TRACE("New client accepted, awesome!");
                     }
                 }
                 else if (event->fd == timeout_fd) {
@@ -529,6 +611,24 @@ void mk_server_worker_loop(struct mk_server *server)
     }
 }
 
+static int mk_server_lib_notify_event_loop_break(struct mk_sched_worker *sched)
+{
+    uint64_t val;
+
+    /* Check the channel is valid (enabled by library mode) */
+    if (sched->signal_channel_w <= 0) {
+        return -1;
+    }
+
+    val = MK_SCHED_SIGNAL_EVENT_LOOP_BREAK;
+
+#ifdef _WIN32
+    return send(sched->signal_channel_w, &val, sizeof(uint64_t), 0);
+#else
+    return write(sched->signal_channel_w, &val, sizeof(uint64_t));
+#endif
+}
+
 static int mk_server_lib_notify_started(struct mk_server *server)
 {
     uint64_t val;
@@ -539,7 +639,12 @@ static int mk_server_lib_notify_started(struct mk_server *server)
     }
 
     val = MK_SERVER_SIGNAL_START;
+
+#ifdef _WIN32
+    return send(server->lib_ch_manager[1], &val, sizeof(uint64_t), 0);
+#else
     return write(server->lib_ch_manager[1], &val, sizeof(uint64_t));
+#endif
 }
 
 
@@ -556,7 +661,7 @@ void mk_server_loop(struct mk_server *server)
 
     /* Wake up workers */
     val = MK_SERVER_SIGNAL_START;
-    mk_sched_send_signal(server, val);
+    mk_sched_broadcast_signal(server, val);
 
     /* Signal lib caller (if any) */
     mk_server_lib_notify_started(server);

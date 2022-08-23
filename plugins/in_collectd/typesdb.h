@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -18,6 +17,8 @@
  *  limitations under the License.
  */
 
+#include "in_collectd.h"
+
 struct typesdb_node {
     char *type;
     int alloc;
@@ -27,7 +28,8 @@ struct typesdb_node {
 };
 
 /* Load and destroy TypesDB */
-struct mk_list *typesdb_load_all(const char *paths);
+struct mk_list *typesdb_load_all(struct flb_in_collectd_config *ctx,
+                                 const char *paths);
 void typesdb_destroy(struct mk_list *tdb);
 
 /* Find a node in TypesDB */

@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -18,10 +17,11 @@
  *  limitations under the License.
  */
 
-#include <fluent-bit/flb_info.h>
+#include <fluent-bit/flb_output_plugin.h>
 #include <fluent-bit/flb_unescape.h>
-
-#include <jsmn/jsmn.h>
+#include <fluent-bit/flb_jsmn.h>
+#include <fluent-bit/flb_utils.h>
+#include <fluent-bit/flb_aws_credentials.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -40,10 +40,13 @@ static inline int key_cmp(char *str, int len, char *cmp) {
     return strncasecmp(str, cmp, len);
 }
 
-static int flb_bigquery_read_credentials_file(char *creds, struct flb_bigquery_oauth_credentials *ctx_creds)
+static int flb_bigquery_read_credentials_file(struct flb_bigquery *ctx,
+                                              char *creds,
+                                              struct flb_bigquery_oauth_credentials *ctx_creds)
 {
     int i;
     int ret;
+    int len;
     int key_len;
     int val_len;
     int tok_size = 32;
@@ -60,22 +63,22 @@ static int flb_bigquery_read_credentials_file(char *creds, struct flb_bigquery_o
     ret = stat(creds, &st);
     if (ret == -1) {
         flb_errno();
-        flb_error("[out_bigquery] cannot open credentials file: %s",
-                  creds);
+        flb_plg_error(ctx->ins, "cannot open credentials file: %s",
+                      creds);
         return -1;
     }
 
     if (!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode)) {
-        flb_error("[out_bigquery] credentials file "
-                  "is not a valid file: %s", creds);
+        flb_plg_error(ctx->ins, "credentials file "
+                      "is not a valid file: %s", creds);
         return -1;
     }
 
     /* Read file content */
     buf = mk_file_to_buffer(creds);
     if (!buf) {
-        flb_error("[out_bigquery] error reading credentials file: %s",
-                  creds);
+        flb_plg_error(ctx->ins, "error reading credentials file: %s",
+                      creds);
         return -1;
     }
 
@@ -90,8 +93,8 @@ static int flb_bigquery_read_credentials_file(char *creds, struct flb_bigquery_o
 
     ret = jsmn_parse(&parser, buf, st.st_size, tokens, tok_size);
     if (ret <= 0) {
-        flb_error("[out_bigquery] invalid JSON credentials file: %s",
-                  creds);
+        flb_plg_error(ctx->ins, "invalid JSON credentials file: %s",
+                      creds);
         flb_free(buf);
         flb_free(tokens);
         return -1;
@@ -99,8 +102,8 @@ static int flb_bigquery_read_credentials_file(char *creds, struct flb_bigquery_o
 
     t = &tokens[0];
     if (t->type != JSMN_OBJECT) {
-        flb_error("[out_bigquery] invalid JSON map on file: %s",
-                  creds);
+        flb_plg_error(ctx->ins, "invalid JSON map on file: %s",
+                      creds);
         flb_free(buf);
         flb_free(tokens);
         return -1;
@@ -140,8 +143,9 @@ static int flb_bigquery_read_credentials_file(char *creds, struct flb_bigquery_o
             tmp = flb_sds_create_len(val, val_len);
             if (tmp) {
                 /* Unescape private key */
-                ctx_creds->private_key = flb_sds_create_size(flb_sds_alloc(tmp));
-                flb_unescape_string(tmp, flb_sds_len(tmp),
+                len = flb_sds_len(tmp);
+                ctx_creds->private_key = flb_sds_create_size(len);
+                flb_unescape_string(tmp, len,
                                     &ctx_creds->private_key);
                 flb_sds_destroy(tmp);
             }
@@ -172,6 +176,7 @@ struct flb_bigquery *flb_bigquery_conf_create(struct flb_output_instance *ins,
 {
     int ret;
     const char *tmp;
+    char *tmp_aws_region;
     struct flb_bigquery *ctx;
     struct flb_bigquery_oauth_credentials *creds;
 
@@ -181,7 +186,15 @@ struct flb_bigquery *flb_bigquery_conf_create(struct flb_output_instance *ins,
         flb_errno();
         return NULL;
     }
+    ctx->ins = ins;
     ctx->config = config;
+
+    ret = flb_output_config_map_set(ins, (void *)ctx);
+    if (ret == -1) {
+        flb_plg_error(ins, "unable to load configuration");
+        flb_free(ctx);
+        return NULL;
+    }
 
     /* Lookup credentials file */
     creds = flb_calloc(1, sizeof(struct flb_bigquery_oauth_credentials));
@@ -192,25 +205,65 @@ struct flb_bigquery *flb_bigquery_conf_create(struct flb_output_instance *ins,
     }
     ctx->oauth_credentials = creds;
 
-    tmp = flb_output_get_property("google_service_credentials", ins);
-    if (tmp) {
-        ctx->credentials_file = flb_sds_create(tmp);
-    }
-    else {
+    if (ctx->credentials_file == NULL) {
         tmp = getenv("GOOGLE_SERVICE_CREDENTIALS");
         if (tmp) {
             ctx->credentials_file = flb_sds_create(tmp);
         }
     }
 
+    if (ctx->credentials_file && ctx->has_identity_federation) {
+        flb_plg_error(ctx->ins, "Either `google_service_credentials` or `enable_identity_federation` should be set");
+        return NULL;
+    }
+
+    if (ctx->aws_region) {
+        tmp_aws_region = flb_aws_endpoint("sts", ctx->aws_region);
+        if (!tmp_aws_region) {
+            flb_plg_error(ctx->ins, "Could not create AWS STS regional endpoint");
+            return NULL;
+        }
+        ctx->aws_sts_endpoint = flb_sds_create(tmp_aws_region);
+        flb_free(tmp_aws_region);
+    }
+
+    if (ctx->has_identity_federation) {
+        if (!ctx->aws_region) {
+            flb_plg_error(ctx->ins, "`aws_region` is required when `enable_identity_federation` is true");
+            return NULL;
+        }
+
+        if (!ctx->project_number) {
+            flb_plg_error(ctx->ins, "`project_number` is required when `enable_identity_federation` is true");
+            return NULL;
+        }
+
+        if (!ctx->pool_id) {
+            flb_plg_error(ctx->ins, "`pool_id` is required when `enable_identity_federation` is true");
+            return NULL;
+        }
+
+        if (!ctx->provider_id) {
+            flb_plg_error(ctx->ins, "`provider_id` is required when `enable_identity_federation` is true");
+            return NULL;
+        }
+
+        if (!ctx->google_service_account) {
+            flb_plg_error(ctx->ins, "`google_service_account` is required when `enable_identity_federation` is true");
+            return NULL;
+        }
+    }
+
     if (ctx->credentials_file) {
-        ret = flb_bigquery_read_credentials_file(ctx->credentials_file, ctx->oauth_credentials);
+        ret = flb_bigquery_read_credentials_file(ctx,
+                                                 ctx->credentials_file,
+                                                 ctx->oauth_credentials);
         if (ret != 0) {
             flb_bigquery_conf_destroy(ctx);
             return NULL;
         }
     }
-    else {
+    else if (!ctx->credentials_file && !ctx->has_identity_federation) {
         /*
          * If no credentials file has been defined, do manual lookup of the
          * client email and the private key.
@@ -241,63 +294,57 @@ struct flb_bigquery *flb_bigquery_conf_create(struct flb_output_instance *ins,
         }
 
         if (!creds->client_email) {
-            flb_error("[out_bigquery] client_email is not defined");
+            flb_plg_error(ctx->ins, "service_account_email/client_email is not defined");
             flb_bigquery_conf_destroy(ctx);
             return NULL;
         }
 
         if (!creds->private_key) {
-            flb_error("[out_bigquery] private_key is not defined");
+            flb_plg_error(ctx->ins, "service_account_secret/private_key is not defined");
             flb_bigquery_conf_destroy(ctx);
             return NULL;
         }
     }
 
     /* config: 'project_id' */
-    tmp = flb_output_get_property("project_id", ins);
-    if (tmp) {
-        ctx->project_id = flb_sds_create(tmp);
-    }
-    else {
-       if (creds->project_id) {
-            ctx->project_id = flb_sds_create(creds->project_id);
+    if (ctx->project_id == NULL) {
+        if (creds->project_id) {
+            /* flb_config_map_destroy uses the pointer within the config_map struct to
+             * free the value so if we assign it here it is safe to free later with the
+             * creds struct. If we do not we will leak here.
+             */
+            ctx->project_id = creds->project_id;
             if (!ctx->project_id) {
-                flb_error("[out_bigquery] failed extracting 'project_id' from credentials.");
+                flb_plg_error(ctx->ins,
+                              "failed extracting 'project_id' from credentials.");
                 flb_bigquery_conf_destroy(ctx);
                 return NULL;
             }
         }
         else {
-            flb_error("[out_bigquery] no 'project_id' configured or present in credentials.");
+            flb_plg_error(ctx->ins,
+                          "no 'project_id' configured or present in credentials.");
             flb_bigquery_conf_destroy(ctx);
             return NULL;
         }
     }
 
     /* config: 'dataset_id' */
-    tmp = flb_output_get_property("dataset_id", ins);
-    if (tmp) {
-        ctx->dataset_id = flb_sds_create(tmp);
-    }
-    else {
-        flb_error("[out_bigquery] property 'dataset_id' is not defined");
+    if (ctx->dataset_id == NULL) {
+        flb_plg_error(ctx->ins, "property 'dataset_id' is not defined");
         flb_bigquery_conf_destroy(ctx);
         return NULL;
     }
 
     /* config: 'table_id' */
-    tmp = flb_output_get_property("table_id", ins);
-    if (tmp) {
-        ctx->table_id = flb_sds_create(tmp);
-    }
-    else {
-        flb_error("[out_bigquery] property 'table_id' is not defined");
+    if (ctx->table_id == NULL) {
+        flb_plg_error(ctx->ins, "property 'table_id' is not defined");
         flb_bigquery_conf_destroy(ctx);
         return NULL;
     }
 
     /* Create the target URI */
-    ctx->uri = flb_sds_create_size(sizeof(FLB_BIGQUERY_RESOURCE_TEMPLATE)-7 +
+    ctx->uri = flb_sds_create_size(sizeof(FLB_BIGQUERY_RESOURCE_TEMPLATE)-6 +
                                    flb_sds_len(ctx->project_id) +
                                    flb_sds_len(ctx->dataset_id) +
                                    flb_sds_len(ctx->table_id));
@@ -306,9 +353,11 @@ struct flb_bigquery *flb_bigquery_conf_create(struct flb_output_instance *ins,
         flb_bigquery_conf_destroy(ctx);
         return NULL;
     }
-    ctx->uri = flb_sds_printf(&ctx->uri, FLB_BIGQUERY_RESOURCE_TEMPLATE, ctx->project_id, ctx->dataset_id, ctx->table_id);
-    flb_info("[out_bigquery] project='%s' dataset='%s' table='%s'",
-             ctx->project_id, ctx->dataset_id, ctx->table_id);
+    ctx->uri = flb_sds_printf(&ctx->uri, FLB_BIGQUERY_RESOURCE_TEMPLATE,
+                              ctx->project_id, ctx->dataset_id, ctx->table_id);
+
+    flb_plg_info(ctx->ins, "project='%s' dataset='%s' table='%s'",
+                 ctx->project_id, ctx->dataset_id, ctx->table_id);
 
     return ctx;
 }
@@ -339,13 +388,42 @@ int flb_bigquery_conf_destroy(struct flb_bigquery *ctx)
         return -1;
     }
 
-    flb_sds_destroy(ctx->credentials_file);
-
     flb_bigquery_oauth_credentials_destroy(ctx->oauth_credentials);
 
-    flb_sds_destroy(ctx->project_id);
-    flb_sds_destroy(ctx->dataset_id);
-    flb_sds_destroy(ctx->table_id);
+    if (ctx->aws_sts_upstream) {
+        flb_upstream_destroy(ctx->aws_sts_upstream);
+    }
+
+    if (ctx->google_sts_upstream) {
+        flb_upstream_destroy(ctx->google_sts_upstream);
+    }
+
+    if (ctx->google_iam_upstream) {
+        flb_upstream_destroy(ctx->google_iam_upstream);
+    }
+
+    if (ctx->aws_provider) {
+        flb_aws_provider_destroy(ctx->aws_provider);
+    }
+
+    if (ctx->aws_tls) {
+        flb_tls_destroy(ctx->aws_tls);
+    }
+
+    if (ctx->aws_sts_tls) {
+        flb_tls_destroy(ctx->aws_sts_tls);
+    }
+
+    if (ctx->google_sts_tls) {
+        flb_tls_destroy(ctx->google_sts_tls);
+    }
+
+    if (ctx->google_iam_tls) {
+        flb_tls_destroy(ctx->google_iam_tls);
+    }
+
+    flb_sds_destroy(ctx->aws_sts_endpoint);
+    flb_sds_destroy(ctx->sa_token);
     flb_sds_destroy(ctx->uri);
 
     if (ctx->o) {

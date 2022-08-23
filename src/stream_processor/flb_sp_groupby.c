@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,10 +23,11 @@
 int flb_sp_groupby_compare(const void *lhs, const void *rhs)
 {
     int i;
-    struct aggr_node *left = (struct aggr_node *) lhs;
-    struct aggr_node *right = (struct aggr_node *) rhs;
-    struct aggr_num *lval;
-    struct aggr_num *rval;
+    int strcmp_result;
+    struct aggregate_node *left = (struct aggregate_node *) lhs;
+    struct aggregate_node *right = (struct aggregate_node *) rhs;
+    struct aggregate_num *lval;
+    struct aggregate_num *rval;
 
     for (i = 0; i < left->groupby_keys; i++) {
         lval = &left->groupby_nums[i];
@@ -68,7 +68,10 @@ int flb_sp_groupby_compare(const void *lhs, const void *rhs)
             }
         }
         else if (lval->type == FLB_SP_STRING && rval->type == FLB_SP_STRING) {
-            return strcmp((const char *) lval->string, (const char *) rval->string);
+            strcmp_result = strcmp((const char *) lval->string, (const char *) rval->string);
+            if (strcmp_result != 0) {
+              return strcmp_result;
+            }
         }
         else { /* Sides have different types */
             return -1;

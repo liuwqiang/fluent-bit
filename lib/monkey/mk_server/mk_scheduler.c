@@ -36,18 +36,16 @@
 #include <monkey/mk_http_thread.h>
 
 #include <signal.h>
-#include <sys/syscall.h>
 
-struct mk_sched_handler mk_http_handler;
-struct mk_sched_handler mk_http2_handler;
+#ifndef _WIN32
+#include <sys/syscall.h>
+#endif
+
+extern struct mk_sched_handler mk_http_handler;
+extern struct mk_sched_handler mk_http2_handler;
 
 pthread_mutex_t mutex_worker_init = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t mutex_worker_exit = PTHREAD_MUTEX_INITIALIZER;
-
-/* Thread initializator helpers (sched_launch_thread) */
-static int pth_init;
-static pthread_cond_t  pth_cond;
-static pthread_mutex_t pth_mutex;
 
 /*
  * Returns the worker id which should take a new incomming connection,
@@ -85,7 +83,8 @@ static inline int _next_target(struct mk_server *server)
      * If sched_ctx->workers[target] worker is full then the whole server too,
      * because it has the lowest load.
      */
-    if (mk_unlikely(cur >= server->server_capacity)) {
+    if (mk_unlikely(server->server_capacity > 0 &&
+                    server->server_capacity <= cur)) {
         MK_TRACE("Too many clients: %i", server->server_capacity);
 
         /* Instruct to close the connection anyways, we lie, it will die */
@@ -262,16 +261,18 @@ static int mk_sched_register_thread(struct mk_server *server)
 {
     struct mk_sched_ctx *ctx = server->sched_ctx;
     struct mk_sched_worker *worker;
-    static int wid = 0;
 
     /*
-     * If this thread slept inside this section, some other thread may touch wid.
-     * So protect it with a mutex, only one thread may handle wid.
+     * If this thread slept inside this section, some other thread may touch
+     * server->worker_id.
+     * So protect it with a mutex, only one thread may handle server->worker_id.
+     *
+     * Note : Let's use the platform agnostic atomics we implemented in cmetrics here
+     * instead of a lock.
      */
-    worker = &ctx->workers[wid];
-    worker->idx = wid++;
+    worker = &ctx->workers[server->worker_id];
+    worker->idx = server->worker_id++;
     worker->tid = pthread_self();
-
 
 #if defined(__linux__)
     /*
@@ -302,12 +303,14 @@ static int mk_sched_register_thread(struct mk_server *server)
 
 static void mk_signal_thread_sigpipe_safe()
 {
+#ifndef _WIN32
     sigset_t old;
     sigset_t set;
 
     sigemptyset(&set);
     sigaddset(&set, SIGPIPE);
     pthread_sigmask(SIG_BLOCK, &set, &old);
+#endif
 }
 
 /* created thread, all these calls are in the thread context */
@@ -346,7 +349,9 @@ void *mk_sched_launch_worker_loop(void *data)
         mk_err("Error creating Scheduler loop");
         exit(EXIT_FAILURE);
     }
-    sched->mem_pagesize = sysconf(_SC_PAGESIZE);
+
+
+    sched->mem_pagesize = mk_utils_get_system_page_size();
 
     /*
      * Create the notification instance and link it to the worker
@@ -395,10 +400,10 @@ void *mk_sched_launch_worker_loop(void *data)
     }
 
     /* Unlock the conditional initializator */
-    pthread_mutex_lock(&pth_mutex);
-    pth_init = MK_TRUE;
-    pthread_cond_signal(&pth_cond);
-    pthread_mutex_unlock(&pth_mutex);
+    pthread_mutex_lock(&server->pth_mutex);
+    server->pth_init = MK_TRUE;
+    pthread_cond_signal(&server->pth_cond);
+    pthread_mutex_unlock(&server->pth_mutex);
 
     /* Invoke custom worker-callbacks defined by the scheduler (lib) */
     mk_list_foreach(head, &server->sched_worker_callbacks) {
@@ -421,13 +426,13 @@ int mk_sched_launch_thread(struct mk_server *server, pthread_t *tout)
     pthread_attr_t attr;
     struct mk_sched_thread_conf *thconf;
 
-    pth_init = MK_FALSE;
+    server->pth_init = MK_FALSE;
 
     /*
      * This lock is used for the 'pth_cond' conditional. Once the worker
      * thread is ready it will signal the condition.
      */
-    pthread_mutex_lock(&pth_mutex);
+    pthread_mutex_lock(&server->pth_mutex);
 
     /* Thread data */
     thconf = mk_mem_alloc_z(sizeof(struct mk_sched_thread_conf));
@@ -438,16 +443,18 @@ int mk_sched_launch_thread(struct mk_server *server, pthread_t *tout)
     if (pthread_create(&tid, &attr, mk_sched_launch_worker_loop,
                        (void *) thconf) != 0) {
         mk_libc_error("pthread_create");
+        pthread_mutex_unlock(&server->pth_mutex);
         return -1;
     }
 
     *tout = tid;
 
     /* Block until the child thread is ready */
-    while (!pth_init) {
-        pthread_cond_wait(&pth_cond, &pth_mutex);
+    while (!server->pth_init) {
+        pthread_cond_wait(&server->pth_cond, &server->pth_mutex);
     }
-    pthread_mutex_unlock(&pth_mutex);
+
+    pthread_mutex_unlock(&server->pth_mutex);
 
     return 0;
 }
@@ -478,15 +485,16 @@ int mk_sched_init(struct mk_server *server)
     memset(ctx->workers, '\0', size);
 
     /* Initialize helpers */
-    pthread_mutex_init(&pth_mutex, NULL);
-    pthread_cond_init(&pth_cond, NULL);
-    pth_init = MK_FALSE;
+    pthread_mutex_init(&server->pth_mutex, NULL);
+    pthread_cond_init(&server->pth_cond, NULL);
+    server->pth_init = MK_FALSE;
 
     /* Map context into server context */
     server->sched_ctx = ctx;
 
-    /* co-routing thread initialization */
-    mk_thread_prepare();
+    /* The mk_thread_prepare call was replaced by mk_http_thread_initialize_tls
+     * which is called earlier.
+     */
 
     return 0;
 }
@@ -564,7 +572,7 @@ int mk_sched_drop_connection(struct mk_sched_conn *conn,
                              struct mk_sched_worker *sched,
                              struct mk_server *server)
 {
-    mk_sched_threads_destroy_all(sched);
+    mk_sched_threads_destroy_conn(sched, conn);
     return mk_sched_remove_client(conn, sched, server);
 }
 
@@ -637,6 +645,31 @@ int mk_sched_threads_destroy_all(struct mk_sched_worker *sched)
 }
 
 /*
+ * Destroy the thread contexts associated to the particular
+ * connection.
+ *
+ * Return the number of contexts destroyed.
+ */
+int mk_sched_threads_destroy_conn(struct mk_sched_worker *sched,
+                                  struct mk_sched_conn *conn)
+{
+    int c = 0;
+    struct mk_list *tmp;
+    struct mk_list *head;
+    struct mk_http_thread *mth;
+    (void) sched;
+
+    mk_list_foreach_safe(head, tmp, &sched->threads) {
+        mth = mk_list_entry(head, struct mk_http_thread, _head);
+        if (mth->session->conn == conn) {
+            mk_http_thread_destroy(mth);
+            c++;
+        }
+    }
+    return c;
+}
+
+/*
  * Scheduler events handler: lookup for event handler and invoke
  * proper callbacks.
  */
@@ -646,7 +679,7 @@ int mk_sched_event_read(struct mk_sched_conn *conn,
 {
     int ret = 0;
 
-#ifdef TRACE
+#ifdef MK_HAVE_TRACE
     MK_TRACE("[FD %i] Connection Handler / read", conn->event.fd);
 #endif
 
@@ -770,24 +803,42 @@ void mk_sched_worker_cb_free(struct mk_server *server)
     }
 }
 
-int mk_sched_send_signal(struct mk_server *server, uint64_t val)
+int mk_sched_send_signal(struct mk_sched_worker *worker, uint64_t val)
+{
+    ssize_t n;
+
+    /* When using libevent _mk_event_channel_create creates a unix socket
+     * instead of a pipe and windows doesn't us calling read / write on a
+     * socket instead of recv / send
+     */
+
+#ifdef _WIN32
+    n = send(worker->signal_channel_w, &val, sizeof(uint64_t), 0);
+#else
+    n = write(worker->signal_channel_w, &val, sizeof(uint64_t));
+#endif
+
+    if (n < 0) {
+        mk_libc_error("write");
+
+        return 0;
+    }
+
+    return 1;
+}
+
+int mk_sched_broadcast_signal(struct mk_server *server, uint64_t val)
 {
     int i;
     int count = 0;
-    ssize_t n;
     struct mk_sched_ctx *ctx;
     struct mk_sched_worker *worker;
 
     ctx = server->sched_ctx;
     for (i = 0; i < server->workers; i++) {
         worker = &ctx->workers[i];
-        n = write(worker->signal_channel_w, &val, sizeof(uint64_t));
-        if (n < 0) {
-            mk_libc_error("write");
-        }
-        else {
-            count++;
-        }
+
+        count += mk_sched_send_signal(worker, val);
     }
 
     return count;

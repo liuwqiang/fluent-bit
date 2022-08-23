@@ -138,6 +138,9 @@ static inline int _mk_event_add(struct mk_event_ctx *ctx, int fd,
     }
 
     event->mask = events;
+    event->priority = MK_EVENT_PRIORITY_DEFAULT;
+    event->_priority_head.next = NULL;
+    event->_priority_head.prev = NULL;
     return ret;
 }
 
@@ -146,14 +149,26 @@ static inline int _mk_event_del(struct mk_event_ctx *ctx, struct mk_event *event
 {
     int ret;
 
+    if ((event->status & MK_EVENT_REGISTERED) == 0) {
+        return 0;
+    }
+
     ret = epoll_ctl(ctx->efd, EPOLL_CTL_DEL, event->fd, NULL);
     MK_TRACE("[FD %i] Epoll, remove from QUEUE_FD=%i, ret=%i",
              event->fd, ctx->efd, ret);
     if (ret < 0) {
-#ifdef TRACE
+#ifdef MK_HAVE_TRACE
         mk_libc_warn("epoll_ctl");
 #endif
     }
+
+    /* Remove from priority queue */
+    if (event->_priority_head.next != NULL &&
+        event->_priority_head.prev != NULL) {
+        mk_list_del(&event->_priority_head);
+    }
+
+    MK_EVENT_NEW(event);
 
     return ret;
 }
@@ -166,20 +181,29 @@ static inline int _mk_event_timeout_create(struct mk_event_ctx *ctx,
     int ret;
     int timer_fd;
     struct itimerspec its;
+    struct timespec now;
     struct mk_event *event;
 
     mk_bug(!data);
     memset(&its, '\0', sizeof(struct itimerspec));
 
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        mk_libc_error("clock_gettime");
+        return -1;
+	}
+
     /* expiration interval */
     its.it_interval.tv_sec  = sec;
     its.it_interval.tv_nsec = nsec;
 
-    /* initial expiration */
-    its.it_value.tv_sec  = time(NULL) + sec;
+    /*
+     * initial expiration: note that we don't use nanoseconds in the timer,
+     * feel free to send a Pull Request if you need it.
+     */
+    its.it_value.tv_sec  = now.tv_sec + sec;
     its.it_value.tv_nsec = 0;
 
-    timer_fd = timerfd_create(CLOCK_REALTIME, 0);
+    timer_fd = timerfd_create(CLOCK_MONOTONIC, 0);
     if (timer_fd == -1) {
         mk_libc_error("timerfd");
         return -1;
@@ -300,9 +324,15 @@ static inline int _mk_event_timeout_create(struct mk_event_ctx *ctx,
 
 static inline int _mk_event_timeout_destroy(struct mk_event_ctx *ctx, void *data)
 {
-    (void) ctx;
-    (void) data;
+    struct mk_event *event;
 
+    if (!data) {
+        return 0;
+    }
+
+    event = (struct mk_event *) data;
+    _mk_event_del(ctx, event);
+    close(event->fd);
     return 0;
 }
 
@@ -338,12 +368,51 @@ static inline int _mk_event_channel_create(struct mk_event_ctx *ctx,
     return 0;
 }
 
-static inline int _mk_event_wait(struct mk_event_loop *loop)
+static inline int _mk_event_inject(struct mk_event_loop *loop,
+                                   struct mk_event *event,
+                                   int mask,
+                                   int prevent_duplication)
+{
+    size_t               index;
+    struct mk_event_ctx *ctx;
+
+    ctx = loop->data;
+
+    if (prevent_duplication) {
+        for (index = 0 ; index < loop->n_events ; index++) {
+            if (ctx->events[index].data.ptr == event) {
+                return 0;
+            }
+        }
+    }
+
+    event->mask = mask;
+
+    ctx->events[loop->n_events].data.ptr = event;
+
+    loop->n_events++;
+
+    return 0;
+}
+
+static inline int _mk_event_wait_2(struct mk_event_loop *loop, int timeout)
 {
     struct mk_event_ctx *ctx = loop->data;
+    int ret = 0;
 
-    loop->n_events = epoll_wait(ctx->efd, ctx->events, ctx->queue_size, -1);
-    return loop->n_events;
+    while(1) {
+        ret = epoll_wait(ctx->efd, ctx->events, ctx->queue_size, timeout);
+        if (ret >= 0) {
+            break;
+        }
+        else if(ret < 0 && errno != EINTR) {
+            mk_libc_error("epoll_wait");
+            break;
+        }
+        /* retry when errno is EINTR */
+    }
+    loop->n_events = ret;
+    return ret;
 }
 
 static inline char *_mk_event_backend()

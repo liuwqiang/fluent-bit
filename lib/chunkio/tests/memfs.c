@@ -75,6 +75,7 @@ static int read_file(const char *file, char *buf, size_t size)
 static void test_memfs_write()
 {
     int i;
+    int err;
     int ret;
     int n_files = 100;
     int flags;
@@ -85,18 +86,26 @@ static void test_memfs_write()
     struct cio_stream *stream;
     struct cio_chunk *chunk;
     struct cio_chunk **carr;
+    struct cio_options cio_opts;
 
     /* Dummy break line for clarity on acutest output */
     printf("\n");
 
     flags = CIO_CHECKSUM;
 
+    memset(&cio_opts, 0, sizeof(cio_opts));
+
+    cio_opts.root_path = NULL;
+    cio_opts.log_cb = log_cb;
+    cio_opts.log_level = CIO_LOG_INFO;
+    cio_opts.flags = flags;
+
     /* Create main context */
-    ctx = cio_create(NULL, log_cb, CIO_INFO, flags);
+    ctx = cio_create(&cio_opts);
     TEST_CHECK(ctx != NULL);
 
     /* Try to create a file with an invalid stream */
-    chunk = cio_chunk_open(ctx, NULL, "invalid", 0, 0);
+    chunk = cio_chunk_open(ctx, NULL, "invalid", 0, 0, &err);
     TEST_CHECK(chunk == NULL);
 
     /* Check invalid stream */
@@ -141,7 +150,7 @@ static void test_memfs_write()
 
     for (i = 0; i < n_files; i++) {
         snprintf(tmp, sizeof(tmp), "api-test-%04i.txt", i);
-        carr[i] = cio_chunk_open(ctx, stream, tmp, CIO_OPEN, 1000000);
+        carr[i] = cio_chunk_open(ctx, stream, tmp, CIO_OPEN, 1000000, &err);
 
         if (carr[i] == NULL) {
             continue;

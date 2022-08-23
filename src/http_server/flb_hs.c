@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2019-2020 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,20 +25,34 @@
 
 #include <monkey/mk_lib.h>
 #include "api/v1/register.h"
+#include "api/v1/health.h"
 
 static void cb_root(mk_request_t *request, void *data)
 {
     struct flb_hs *hs = data;
 
     mk_http_status(request, 200);
+    flb_hs_add_content_type_to_req(request, FLB_HS_CONTENT_TYPE_JSON);
     mk_http_send(request, hs->ep_root_buf, hs->ep_root_size, NULL);
     mk_http_done(request);
 }
 
-/* Ingest metrics into the web service context */
-int flb_hs_push_metrics(struct flb_hs *hs, void *data, size_t size)
+/* Ingest health metrics into the web service context */
+int flb_hs_push_health_metrics(struct flb_hs *hs, void *data, size_t size)
 {
-    return mk_mq_send(hs->ctx, hs->qid, data, size);
+    return mk_mq_send(hs->ctx, hs->qid_health, data, size);
+}
+
+/* Ingest pipeline metrics into the web service context */
+int flb_hs_push_pipeline_metrics(struct flb_hs *hs, void *data, size_t size)
+{
+    return mk_mq_send(hs->ctx, hs->qid_metrics, data, size);
+}
+
+/* Ingest storage metrics into the web service context */
+int flb_hs_push_storage_metrics(struct flb_hs *hs, void *data, size_t size)
+{
+    return mk_mq_send(hs->ctx, hs->qid_storage, data, size);
 }
 
 /* Create ROOT endpoints */
@@ -108,12 +121,13 @@ int flb_hs_destroy(struct flb_hs *hs)
     if (!hs) {
         return 0;
     }
-
+    flb_hs_health_destroy();
     mk_stop(hs->ctx);
     mk_destroy(hs->ctx);
 
     flb_hs_endpoints_free(hs);
     flb_free(hs);
+
 
     return 0;
 }

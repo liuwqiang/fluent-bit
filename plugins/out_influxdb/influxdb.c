@@ -2,8 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2019      The Fluent Bit Authors
- *  Copyright (C) 2015-2018 Treasure Data Inc.
+ *  Copyright (C) 2015-2022 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -18,28 +17,24 @@
  *  limitations under the License.
  */
 
-#include <fluent-bit/flb_info.h>
-#include <fluent-bit/flb_output.h>
+#include <fluent-bit/flb_output_plugin.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_http_client.h>
 #include <fluent-bit/flb_time.h>
-#include <msgpack.h>
+#include <fluent-bit/flb_metrics.h>
 
-#include <stdio.h>
+#include <msgpack.h>
 
 #include "influxdb.h"
 #include "influxdb_bulk.h"
 
-/*
- * Returns FLB_TRUE if the specified value is true, otherwise FLB_FALSE
- */
-static int bool_value(const char *v);
+#include <stdio.h>
 
 /*
  * Returns FLB_TRUE when the specified key is in Tag_Keys list,
  * otherwise FLB_FALSE
  */
-static int is_tagged_key(struct flb_influxdb_config *ctx,
+static int is_tagged_key(struct flb_influxdb *ctx,
                          const char *key, int kl, int type);
 
 /*
@@ -63,8 +58,8 @@ static void influxdb_tsmod(struct flb_time *ts, struct flb_time *dupe,
  * by InfluxDB.
  */
 static char *influxdb_format(const char *tag, int tag_len,
-                             const void *data, size_t bytes, int *out_size,
-                             struct flb_influxdb_config *ctx)
+                             const void *data, size_t bytes, size_t *out_size,
+                             struct flb_influxdb *ctx)
 {
     int i;
     int ret;
@@ -209,7 +204,7 @@ static char *influxdb_format(const char *tag, int tag_len,
                 val = tmp;
                 val_len = snprintf(tmp, sizeof(tmp) - 1, "%" PRId64, v->via.i64);
             }
-            else if (v->type == MSGPACK_OBJECT_FLOAT) {
+            else if (v->type == MSGPACK_OBJECT_FLOAT || v->type == MSGPACK_OBJECT_FLOAT32) {
                 val = tmp;
                 val_len = snprintf(tmp, sizeof(tmp) - 1, "%f", v->via.f64);
             }
@@ -264,7 +259,7 @@ static char *influxdb_format(const char *tag, int tag_len,
             }
 
             if (ret == -1) {
-                flb_error("[out_influxdb] cannot append key/value");
+                flb_plg_error(ctx->ins, "cannot append key/value");
                 goto error;
             }
         }
@@ -276,7 +271,7 @@ static char *influxdb_format(const char *tag, int tag_len,
             /* Append the timestamp */
             ret = influxdb_bulk_append_timestamp(bulk_body, &tm);
             if (ret == -1) {
-                flb_error("[out_influxdb] cannot append timestamp");
+                flb_plg_error(ctx->ins, "cannot append timestamp");
                 goto error;
             }
 
@@ -285,9 +280,11 @@ static char *influxdb_format(const char *tag, int tag_len,
                 influxdb_bulk_append_bulk(bulk, bulk_body, ' ') != 0) {
                 goto error;
             }
-        } else {
-            flb_error("[out_influxdb] cannot send record, "
-                      "because all field is tagged in record");
+        }
+        else {
+            flb_plg_warn(ctx->ins, "skip send record, "
+                         "since no record available "
+                         "or all fields are tagged in record");
             /* Following records maybe ok, so continue processing */
         }
 
@@ -326,27 +323,38 @@ error:
     return NULL;
 }
 
-int cb_influxdb_init(struct flb_output_instance *ins, struct flb_config *config,
-                     void *data)
+static int cb_influxdb_init(struct flb_output_instance *ins, struct flb_config *config,
+                            void *data)
 {
+    int ret;
     int io_flags = 0;
     const char *tmp;
     struct flb_upstream *upstream;
-    struct flb_influxdb_config *ctx;
+    struct flb_influxdb *ctx;
 
-    /* Get network configuration */
-    if (!ins->host.name) {
-        ins->host.name = flb_strdup(FLB_INFLUXDB_HOST);
-    }
-
-    if (ins->host.port == 0) {
-        ins->host.port = FLB_INFLUXDB_PORT;
-    }
+    /* Set default network configuration */
+    flb_output_net_default(FLB_INFLUXDB_HOST, FLB_INFLUXDB_PORT, ins);
 
     /* Allocate plugin context */
-    ctx = flb_calloc(1, sizeof(struct flb_influxdb_config));
+    ctx = flb_calloc(1, sizeof(struct flb_influxdb));
     if (!ctx) {
         flb_errno();
+        return -1;
+    }
+    ctx->ins = ins;
+
+    /* Register context with plugin instance */
+    flb_output_set_context(ins, ctx);
+
+    /*
+     * This plugin instance uses the HTTP client interface, let's register
+     * it debugging callbacks.
+     */
+    flb_output_set_http_debug_callbacks(ins);
+
+    /* Load config map */
+    ret = flb_output_config_map_set(ins, (void *) ctx);
+    if (ret == -1) {
         return -1;
     }
 
@@ -356,16 +364,6 @@ int cb_influxdb_init(struct flb_output_instance *ins, struct flb_config *config,
     else {
         io_flags = FLB_IO_TCP;
     }
-
-    /* database */
-    tmp = flb_output_get_property("database", ins);
-    if (!tmp) {
-        ctx->db_name = flb_strdup("fluentbit");
-    }
-    else {
-        ctx->db_name = flb_strdup(tmp);
-    }
-    ctx->db_len = strlen(ctx->db_name);
 
     /* sequence tag */
     tmp = flb_output_get_property("sequence_tag", ins);
@@ -380,34 +378,31 @@ int cb_influxdb_init(struct flb_output_instance *ins, struct flb_config *config,
     }
     ctx->seq_len = strlen(ctx->seq_name);
 
-    snprintf(ctx->uri, sizeof(ctx->uri) - 1, "/write?db=%s&precision=n", ctx->db_name);
+    if (ctx->custom_uri) {
+        /* custom URI endpoint (e.g: Grafana */
+        if (ctx->custom_uri[0] != '/') {
+            flb_plg_error(ctx->ins,
+                          "'custom_uri' value must start wih a forward slash '/'");
+            return -1;
+        }
+        snprintf(ctx->uri, sizeof(ctx->uri) - 1, "%s", ctx->custom_uri);
+    }
+    else if (ctx->bucket) {
+        /* bucket: api v2 */
+        snprintf(ctx->uri, sizeof(ctx->uri) - 1,
+                 "/api/v2/write?org=%s&bucket=%s&precision=ns",
+                 ctx->organization, ctx->bucket);
+    }
+    else {
+        snprintf(ctx->uri, sizeof(ctx->uri) - 1,
+                 "/write?db=%s&precision=n",
+                 ctx->database);
+    }
 
     if (ins->host.ipv6 == FLB_TRUE) {
         io_flags |= FLB_IO_IPV6;
     }
 
-    /* HTTP Auth */
-    tmp = flb_output_get_property("http_user", ins);
-    if (tmp) {
-        ctx->http_user = flb_strdup(tmp);
-
-        tmp = flb_output_get_property("http_passwd", ins);
-        if (tmp) {
-            ctx->http_passwd = flb_strdup(tmp);
-        }
-        else {
-            ctx->http_passwd = flb_strdup("");
-        }
-    }
-
-    /* Auto_Tags */
-    tmp = flb_output_get_property("auto_tags", ins);
-    if (tmp) {
-        ctx->auto_tags = bool_value(tmp);
-    }
-    else {
-        ctx->auto_tags = FLB_FALSE;
-    }
 
     /* Tag_Keys */
     tmp = flb_output_get_property("tag_keys", ins);
@@ -423,47 +418,107 @@ int cb_influxdb_init(struct flb_output_instance *ins, struct flb_config *config,
                                    ins->host.name,
                                    ins->host.port,
                                    io_flags,
-                                   &ins->tls);
+                                   ins->tls);
     if (!upstream) {
         flb_free(ctx);
         return -1;
     }
     ctx->u   = upstream;
     ctx->seq = 0;
+    flb_output_upstream_set(ctx->u, ins);
 
     flb_time_zero(&ctx->ts_dupe);
     flb_time_zero(&ctx->ts_last);
 
-    flb_debug("[out_influxdb] host=%s port=%i", ins->host.name, ins->host.port);
-    flb_output_set_context(ins, ctx);
+    flb_plg_debug(ctx->ins, "host=%s port=%i", ins->host.name, ins->host.port);
 
     return 0;
 }
 
-void cb_influxdb_flush(const void *data, size_t bytes,
-                       const char *tag, int tag_len,
-                       struct flb_input_instance *i_ins,
-                       void *out_context,
-                       struct flb_config *config)
+static int format_metrics(struct flb_output_instance *ins,
+                          const void *data, size_t bytes,
+                          char **out_buf, size_t *out_size)
 {
     int ret;
-    int bytes_out;
+    size_t off = 0;
+    cmt_sds_t text;
+    struct cmt *cmt = NULL;
+
+    /* get cmetrics context */
+    ret = cmt_decode_msgpack_create(&cmt, (char *) data, bytes, &off);
+    if (ret != 0) {
+        flb_plg_error(ins, "could not process metrics payload");
+        return -1;
+    }
+
+    /* convert to text representation */
+    text = cmt_encode_influx_create(cmt);
+    if (!text) {
+        cmt_destroy(cmt);
+        return -1;
+    }
+
+    /* destroy cmt context */
+    cmt_destroy(cmt);
+
+    *out_buf = text;
+    *out_size = flb_sds_len(text);
+
+    return 0;
+}
+
+static void cb_influxdb_flush(struct flb_event_chunk *event_chunk,
+                              struct flb_output_flush *out_flush,
+                              struct flb_input_instance *i_ins,
+                              void *out_context,
+                              struct flb_config *config)
+{
+    int ret;
+    int out_ret = FLB_OK;
+    int is_metric = FLB_FALSE;
     size_t b_sent;
+    size_t bytes_out;
     char *pack;
+    char tmp[128];
+    struct mk_list *head;
     struct flb_upstream_conn *u_conn;
     struct flb_http_client *c;
-    struct flb_influxdb_config *ctx = out_context;
+    struct flb_config_map_val *mv;
+    struct flb_slist_entry *key = NULL;
+    struct flb_slist_entry *val = NULL;
+    struct flb_influxdb *ctx = out_context;
 
-    /* Convert format */
-    pack = influxdb_format(tag, tag_len, data, bytes, &bytes_out, ctx);
-    if (!pack) {
-        FLB_OUTPUT_RETURN(FLB_ERROR);
+    /* Convert format: metrics / logs */
+    if (event_chunk->type == FLB_EVENT_TYPE_METRIC) {
+        /* format metrics */
+        ret = format_metrics(ctx->ins,
+                             (char *) event_chunk->data,
+                             event_chunk->size,
+                             &pack, &bytes_out);
+        if (ret == -1) {
+            FLB_OUTPUT_RETURN(FLB_ERROR);
+        }
+        is_metric = FLB_TRUE;
+    }
+    else {
+        /* format logs */
+        pack = influxdb_format(event_chunk->tag, flb_sds_len(event_chunk->tag),
+                               event_chunk->data, event_chunk->size,
+                               &bytes_out, ctx);
+        if (!pack) {
+            FLB_OUTPUT_RETURN(FLB_ERROR);
+        }
     }
 
     /* Get upstream connection */
     u_conn = flb_upstream_conn_get(ctx->u);
     if (!u_conn) {
-        flb_free(pack);
+        if (is_metric) {
+            cmt_encode_influx_destroy(pack);
+        }
+        else {
+            flb_free(pack);
+        }
         FLB_OUTPUT_RETURN(FLB_RETRY);
     }
 
@@ -472,76 +527,80 @@ void cb_influxdb_flush(const void *data, size_t bytes,
                         pack, bytes_out, NULL, 0, NULL, 0);
     flb_http_add_header(c, "User-Agent", 10, "Fluent-Bit", 10);
 
-    if (ctx->http_user && ctx->http_passwd) {
+    if (ctx->http_token) {
+        ret = snprintf(tmp, sizeof(tmp) - 1, "Token %s", ctx->http_token);
+        flb_http_add_header(c, FLB_HTTP_HEADER_AUTH, sizeof FLB_HTTP_HEADER_AUTH - 1, tmp, ret);
+    }
+    else if (ctx->http_user && ctx->http_passwd) {
         flb_http_basic_auth(c, ctx->http_user, ctx->http_passwd);
     }
+
+    /* Append custom headers if any */
+    flb_config_map_foreach(head, mv, ctx->headers) {
+        key = mk_list_entry_first(mv->val.list, struct flb_slist_entry, _head);
+        val = mk_list_entry_last(mv->val.list, struct flb_slist_entry, _head);
+
+        flb_http_add_header(c,
+                            key->str, flb_sds_len(key->str),
+                            val->str, flb_sds_len(val->str));
+    }
+
+    /* Map debug callbacks */
+    flb_http_client_debug(c, ctx->ins->callback);
 
     ret = flb_http_do(c, &b_sent);
     if (ret == 0) {
         if (c->resp.status != 200 && c->resp.status != 204) {
             if (c->resp.payload_size > 0) {
-                flb_error("[out_influxdb] http_status=%i\n%s",
-                          c->resp.status, c->resp.payload);
+                flb_plg_error(ctx->ins, "http_status=%i\n%s",
+                              c->resp.status, c->resp.payload);
             }
             else {
-                flb_debug("[out_influxdb] http_status=%i",
-                          c->resp.status);
+                flb_plg_debug(ctx->ins, "http_status=%i",
+                              c->resp.status);
             }
         }
-        flb_debug("[out_influxdb] http_do=%i OK", ret);
+        flb_plg_debug(ctx->ins, "http_do=%i OK", ret);
     }
     else {
-        flb_warn("[out_influxdb] http_do=%i", ret);
+        flb_plg_error(ctx->ins, "http_do=%i", ret);
+        out_ret = FLB_RETRY;
     }
 
     flb_http_client_destroy(c);
 
-    flb_free(pack);
+    if (is_metric) {
+        cmt_encode_influx_destroy(pack);
+    }
+    else {
+        flb_free(pack);
+    }
 
     /* Release the connection */
     flb_upstream_conn_release(u_conn);
 
-    FLB_OUTPUT_RETURN(FLB_OK);
+    FLB_OUTPUT_RETURN(out_ret);
 }
 
-int cb_influxdb_exit(void *data, struct flb_config *config)
+static int cb_influxdb_exit(void *data, struct flb_config *config)
 {
-    struct flb_influxdb_config *ctx = data;
+    struct flb_influxdb *ctx = data;
 
-    if (ctx->http_user) {
-        flb_free(ctx->http_user);
+    if (!ctx) {
+        return 0;
     }
-    if (ctx->http_passwd) {
-        flb_free(ctx->http_passwd);
-    }
+
     if (ctx->tag_keys) {
         flb_utils_split_free(ctx->tag_keys);
     }
 
     flb_upstream_destroy(ctx->u);
-    flb_free(ctx->db_name);
-    flb_free(ctx->seq_name);
     flb_free(ctx);
 
     return 0;
 }
 
-int bool_value(const char *v)
-{
-    if (strcasecmp(v, "true") == 0) {
-        return FLB_TRUE;
-    }
-    else if (strcasecmp(v, "on") == 0) {
-        return FLB_TRUE;
-    }
-    else if (strcasecmp(v, "yes") == 0) {
-        return FLB_TRUE;
-    }
-
-    return FLB_FALSE;
-}
-
-int is_tagged_key(struct flb_influxdb_config *ctx, const char *key, int kl, int type)
+int is_tagged_key(struct flb_influxdb *ctx, const char *key, int kl, int type)
 {
     if (type == MSGPACK_OBJECT_STR) {
         if (ctx->auto_tags) {
@@ -554,7 +613,7 @@ int is_tagged_key(struct flb_influxdb_config *ctx, const char *key, int kl, int 
 
     if (ctx->tag_keys) {
         mk_list_foreach(head, ctx->tag_keys) {
-            entry = mk_list_entry(head, struct flb_split_entry ,_head);
+            entry = mk_list_entry(head, struct flb_split_entry, _head);
             if (kl == entry->len && strncmp(key, entry->value, kl) == 0) {
                 return FLB_TRUE;
             }
@@ -564,6 +623,77 @@ int is_tagged_key(struct flb_influxdb_config *ctx, const char *key, int kl, int 
     return FLB_FALSE;
 }
 
+/* Configuration properties map */
+static struct flb_config_map config_map[] = {
+    {
+     FLB_CONFIG_MAP_STR, "database", "fluentbit",
+     0, FLB_TRUE, offsetof(struct flb_influxdb, database),
+     "Set the database name."
+    },
+    {
+     FLB_CONFIG_MAP_STR, "bucket", NULL,
+     0, FLB_TRUE, offsetof(struct flb_influxdb, bucket),
+     "Specify the bucket name, used on InfluxDB API v2."
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "org", "fluent",
+     0, FLB_TRUE, offsetof(struct flb_influxdb, organization),
+     "Set the Organization name."
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "sequence_tag", NULL,
+     0, FLB_FALSE, 0,
+     "Specify the sequence tag."
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "uri", NULL,
+     0, FLB_TRUE, offsetof(struct flb_influxdb, custom_uri),
+     "Specify a custom URI endpoint (must start with '/')."
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "http_user", NULL,
+     0, FLB_TRUE, offsetof(struct flb_influxdb, http_user),
+     "HTTP Basic Auth username."
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "http_passwd", "",
+     0, FLB_TRUE, offsetof(struct flb_influxdb, http_passwd),
+     "HTTP Basic Auth password."
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "http_token", NULL,
+     0, FLB_TRUE, offsetof(struct flb_influxdb, http_token),
+     "Set InfluxDB HTTP Token API v2."
+    },
+
+    {
+     FLB_CONFIG_MAP_SLIST_1, "http_header", NULL,
+     FLB_CONFIG_MAP_MULT, FLB_TRUE, offsetof(struct flb_influxdb, headers),
+     "Add a HTTP header key/value pair. Multiple headers can be set"
+    },
+
+    {
+     FLB_CONFIG_MAP_BOOL, "auto_tags", "false",
+     0, FLB_TRUE, offsetof(struct flb_influxdb, auto_tags),
+     "Automatically tag keys where value is string."
+    },
+
+    {
+     FLB_CONFIG_MAP_BOOL, "tag_keys", NULL,
+     0, FLB_FALSE, 0,
+     "Space separated list of keys that needs to be tagged."
+    },
+
+    /* EOF */
+    {0}
+};
+
 struct flb_output_plugin out_influxdb_plugin = {
     .name         = "influxdb",
     .description  = "InfluxDB Time Series",
@@ -571,5 +701,7 @@ struct flb_output_plugin out_influxdb_plugin = {
     .cb_pre_run     = NULL,
     .cb_flush     = cb_influxdb_flush,
     .cb_exit      = cb_influxdb_exit,
+    .config_map   = config_map,
     .flags        = FLB_OUTPUT_NET | FLB_IO_OPT_TLS,
+    .event_type   = FLB_OUTPUT_LOGS | FLB_OUTPUT_METRICS
 };
